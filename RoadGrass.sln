@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36401.2 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RoadGrass", "RoadGrass.csproj", "{BAC6A720-11D2-4A7A-A39F-4F3FB9AAE268}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BAC6A720-11D2-4A7A-A39F-4F3FB9AAE268}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BAC6A720-11D2-4A7A-A39F-4F3FB9AAE268}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BAC6A720-11D2-4A7A-A39F-4F3FB9AAE268}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BAC6A720-11D2-4A7A-A39F-4F3FB9AAE268}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {76CA15E1-C238-49C1-AC90-88466EEE8755}
+	EndGlobalSection
+EndGlobal
