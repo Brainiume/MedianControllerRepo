@@ -2,12 +2,27 @@ using Game.Modding;
 using Game.Settings;
 using Colossal.IO.AssetDatabase;
 using Game.UI;
+using Game.Input;
 
 namespace RoadGrass
 {
     [FileLocation("MedianController")]
+    [SettingsUIKeyboardAction(CloseTool, Usages.kToolUsage)]
+    [SettingsUIGamepadAction(CloseTool, Usages.kToolUsage)]
     public sealed class RoadGrassSettings : ModSetting
     {
+        internal const string CloseTool = "CloseTool";
+
+        [SettingsUIHidden]
+        [SettingsUIKeyboardBinding(BindingKeyboard.Escape, CloseTool)]
+        [SettingsUIBindingMimic(InputManager.kToolMap, "Cancel")]
+        public ProxyBinding CloseToolKeyboard { get; set; }
+
+        [SettingsUIHidden]
+        [SettingsUIGamepadBinding(BindingGamepad.East, CloseTool)]
+        [SettingsUIBindingMimic(InputManager.kToolMap, "Cancel")]
+        public ProxyBinding CloseToolGamepad { get; set; }
+
         internal const float DefaultStretchFactor = 0.84f;
         private float m_NarrowMedianStretchFactor = DefaultStretchFactor;
         internal static float AppliedStretchFactor { get; private set; } = DefaultStretchFactor;

@@ -16,6 +16,7 @@ namespace RoadGrass
             .SetShowsErrorsInUI(false);
 
         private RoadGrassSettings m_Settings;
+        internal static Game.Input.ProxyAction CloseToolAction { get; private set; }
 
         public void OnLoad(UpdateSystem updateSystem)
         {
@@ -32,6 +33,8 @@ namespace RoadGrass
             m_Settings.Apply();
             GameManager.instance.localizationManager.AddSource("en-US", new LocaleEN(m_Settings));
             m_Settings.RegisterInOptionsUI();
+            m_Settings.RegisterKeyBindings();
+            CloseToolAction = m_Settings.GetAction(RoadGrassSettings.CloseTool);
 
             updateSystem.UpdateAt<RoadGrassPrefabSystem>(SystemUpdatePhase.UIUpdate);
             updateSystem.UpdateAt<RoadGrassUISystem>(SystemUpdatePhase.UIUpdate);
@@ -80,6 +83,7 @@ namespace RoadGrass
         {
             RoadGrassPolygonPrototypeBatchSystem.Instance?.Shutdown();
             m_Settings?.UnregisterInOptionsUI();
+            CloseToolAction = null;
             m_Settings = null;
             TryInfo(nameof(OnDispose));
         }

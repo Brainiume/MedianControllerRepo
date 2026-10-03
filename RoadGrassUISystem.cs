@@ -28,6 +28,7 @@ namespace RoadGrass
         private ValueBinding<bool> m_IsActiveBinding;
         private ValueBinding<bool> m_ExtendBinding;
         private ValueBinding<bool> m_SnappingBinding;
+        private ValueBinding<bool> m_PlacingPolygonPointsBinding;
         private ValueBinding<bool> m_PolygonExtendBinding;
         private ValueBinding<float> m_PolygonCurbWidthBinding;
         internal bool PolygonSnapping { get; private set; } = true;
@@ -38,6 +39,7 @@ namespace RoadGrass
         private ValueBinding<bool> m_PolygonSelectedBinding, m_PolygonOpeningBinding;
         private ValueBinding<float> m_LineOffsetBinding, m_MedianOffsetBinding, m_LineRadiusBinding, m_MedianRadiusBinding, m_OffsetLimitBinding;
         private bool m_Synchronizing;
+        private bool m_MedianActivationPending;
 
         internal MedianControllerMode ActiveMode { get; private set; } = MedianControllerMode.Connect;
         internal MedianCapChoice EditCapChoice { get; private set; } = MedianCapChoice.Rounded;
@@ -54,6 +56,7 @@ namespace RoadGrass
             m_NetToolSystem = World.GetOrCreateSystemManaged<NetToolSystem>();
             m_JoinToolSystem = World.GetOrCreateSystemManaged<RoadGrassJoinToolSystem>();
             AddBinding(m_SnappingBinding = new ValueBinding<bool>(ModId, "PolygonSnapping", PolygonSnapping));
+            AddBinding(m_PlacingPolygonPointsBinding = new ValueBinding<bool>(ModId, "PlacingPolygonPoints", false));
             AddBinding(new TriggerBinding<bool>(ModId, "SetPolygonSnapping", value =>
             { PolygonSnapping = value; m_SnappingBinding.Update(value); }));
             AddBinding(m_PolygonExtendBinding = new ValueBinding<bool>(ModId, "PolygonExtendFromMedian", PolygonExtendFromMedian));
@@ -123,8 +126,22 @@ namespace RoadGrass
             m_ToolSystem.EventPrefabChanged += OnPrefabChanged;
         }
 
-        private void OnToolChanged(ToolBaseSystem tool) => SynchronizeTool();
-        private void OnPrefabChanged(PrefabBase prefab) => SynchronizeTool();
+        private void OnToolChanged(ToolBaseSystem tool)
+        {
+            if (tool != m_JoinToolSystem && !m_MedianActivationPending &&
+                m_NetToolSystem.prefab?.name == RoadGrassPrefabSystem.PrefabName)
+                m_NetToolSystem.prefab = null;
+            if (tool != m_NetToolSystem) m_MedianActivationPending = false;
+            SynchronizeTool();
+        }
+
+        private void OnPrefabChanged(PrefabBase prefab)
+        {
+            m_MedianActivationPending = prefab != null && prefab == m_NetToolSystem.prefab &&
+                prefab.name == RoadGrassPrefabSystem.PrefabName;
+            // NetToolSystem raises this before ActivatePrefabTool finishes selecting its tool.
+            // Redirect on the tool-change event (or the next UI update), never inside this event.
+        }
 
         private void SynchronizeTool()
         {
@@ -132,9 +149,10 @@ namespace RoadGrass
             m_Synchronizing = true;
             try
             {
-                if (m_ToolSystem.activeTool == m_NetToolSystem &&
+                if (m_MedianActivationPending && m_ToolSystem.activeTool == m_NetToolSystem &&
                     m_NetToolSystem.prefab?.name == RoadGrassPrefabSystem.PrefabName)
                 {
+                    m_MedianActivationPending = false;
                     m_JoinToolSystem.SetToolPrefab(m_NetToolSystem.prefab);
                     m_ToolSystem.activeTool = m_JoinToolSystem;
                 }
@@ -161,7 +179,10 @@ namespace RoadGrass
         protected override void OnUpdate()
         {
             base.OnUpdate();
+            if (m_MedianActivationPending) SynchronizeTool();
             var manager = RoadGrassJoinCompositionSystem.Instance;
+            m_PlacingPolygonPointsBinding.Update(m_ToolSystem.activeTool == m_JoinToolSystem &&
+                ActiveMode == MedianControllerMode.Polygon && m_JoinToolSystem.HasPendingSelection);
             m_SelectedManualBinding.Update(manager?.SelectedManualMedianId ?? 0);
             m_ManualSurfaceBinding.Update(manager?.SelectedManualMedianSurface ?? 0);
             m_CanEditManualBinding.Update(manager?.CanEditSelectedManualMedian ?? false);

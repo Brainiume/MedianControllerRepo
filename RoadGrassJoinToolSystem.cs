@@ -100,6 +100,8 @@ namespace RoadGrass
             RoadGrassJoinTooltipState.SelectFirst;
 
         public override string toolID => "RoadGrassJoinMedian";
+        internal Game.Input.IProxyAction ApplyInput => applyAction;
+        internal Game.Input.IProxyAction SecondaryApplyInput => secondaryApplyAction;
 
         internal void SetToolPrefab(NetPrefab prefab)
         {
@@ -142,9 +144,9 @@ namespace RoadGrass
             base.OnStartRunning();
             applyAction.shouldBeEnabled = true;
             secondaryApplyAction.shouldBeEnabled = true;
-            // Like NetToolSystem's idle upgrade mode, reserve the secondary
-            // action for removal. Cancel competes for the same mouse input.
-            cancelAction.shouldBeEnabled = false;
+            // Follow native keyboard/gamepad Cancel bindings without competing with mouse removal.
+            cancelActionOverride = Mod.CloseToolAction;
+            cancelAction.shouldBeEnabled = true;
             m_FirstAnchor = null;
             m_MainCamera = Camera.main;
         }
@@ -163,8 +165,12 @@ namespace RoadGrass
         [Preserve]
         protected override JobHandle OnUpdate(JobHandle inputDeps)
         {
-            if (Options.ActiveMode == MedianControllerMode.Polygon && UnityEngine.InputSystem.Keyboard.current?.escapeKey.wasPressedThisFrame == true)
-            { Options.SetActiveMode((int)MedianControllerMode.Edit); return inputDeps; }
+            if (cancelAction.WasPressedThisFrame())
+            {
+                ClearTransientSelection();
+                m_ToolSystem.activeTool = m_DefaultToolSystem;
+                return inputDeps;
+            }
             RoadGrassJoinCompositionSystem manager = RoadGrassJoinCompositionSystem.Instance;
             RoadGrassResolvedMedianAnchor hovered = null;
             bool hitRoad = false;

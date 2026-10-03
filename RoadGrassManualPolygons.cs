@@ -4,6 +4,7 @@ using Colossal.Mathematics;
 using Game.Net;
 using Game.Prefabs;
 using Game.Rendering;
+using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
 
@@ -188,7 +189,7 @@ namespace RoadGrass
             MedianSavedSurface surface, out List<RoadGrassTransitionMesh.Half> halves, out string reason)
         {
             halves = new List<RoadGrassTransitionMesh.Half>();
-            if (!TryManualSurface(anchor, surface, out var styled)) { reason = "Native median surface unavailable"; return false; }
+            if (!TryPolygonSurface(anchor, surface, out var styled)) { reason = "Native median surface unavailable (vanilla fallback unavailable)"; return false; }
             float2 borders = RoadGrassTransitionMesh.ReadBorderWidths(EntityManager, styled);
             foreach (var section in sections)
             {
@@ -201,6 +202,48 @@ namespace RoadGrass
             }
             reason = "";
             return true;
+        }
+
+        private bool TryPolygonSurface(RoadGrassResolvedMedianAnchor anchor, MedianSavedSurface surface,
+            out RoadGrassResolvedMedianAnchor styled)
+        {
+            if (TryManualSurface(anchor, surface, out styled)) return true;
+            bool grass = surface == MedianSavedSurface.Grass || (surface == MedianSavedSurface.None &&
+                (anchor.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
+            var prefabs = World.GetExistingSystemManaged<PrefabSystem>();
+            if (prefabs == null) return false;
+            int preferred = anchor.Width <= 3.5f ? 2 : 5;
+            foreach (int width in new[] { preferred, preferred == 2 ? 5 : 2 })
+            {
+                var id = new PrefabID(nameof(NetPiecePrefab), $"Median Piece {width}" + (grass ? " - Grass" : ""));
+                if (!prefabs.TryGetPrefab(id, out var prefab)) continue;
+                Entity piece = prefabs.GetEntity(prefab);
+                if (!EntityManager.HasComponent<NetPieceData>(piece) || !EntityManager.HasBuffer<MeshMaterial>(piece)) continue;
+                var pieces = new List<NetCompositionPiece> { new NetCompositionPiece
+                {
+                    m_Piece = piece,
+                    m_SectionFlags = NetSectionFlags.Median,
+                    m_PieceFlags = NetPieceFlags.Surface | NetPieceFlags.HasMesh | NetPieceFlags.BlockTraffic
+                } };
+                var composition = anchor.StandaloneComposition;
+                composition.m_Flags = WithSurface(composition.m_Flags, grass ? MedianSavedSurface.Grass : MedianSavedSurface.Plain);
+                using (var nativePieces = new NativeArray<NetCompositionPiece>(pieces.ToArray(), Allocator.Temp))
+                {
+                    NetCompositionHelpers.CalculateCompositionData(ref composition, nativePieces,
+                        GetComponentLookup<NetPieceData>(true), GetComponentLookup<NetVertexMatchData>(true));
+                    pieces[0] = nativePieces[0];
+                }
+                // Substitute render style only; keep the parent and saved geometry on the original road.
+                styled = new RoadGrassResolvedMedianAnchor
+                {
+                    Key = anchor.Key, Node = anchor.Node, Data = anchor.Data,
+                    SourceComposition = anchor.SourceComposition, RoadComposition = anchor.RoadComposition,
+                    StandaloneComposition = composition, Pieces = pieces, Center = anchor.Center,
+                    Width = composition.m_Width, Left = anchor.Left, Right = anchor.Right, Signature = anchor.Signature
+                };
+                return true;
+            }
+            return false;
         }
 
         private bool TryPolygonAttachment(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points, out Segment opening)
@@ -374,7 +417,8 @@ namespace RoadGrass
                     median.Saved.ExtendFromMedian ? PolygonOpeningEdges(source, points) : new bool[points.Count],
                     median.Saved.Shape, median.Saved.ExtendFromMedian);
                 var origin = EntityManager.GetComponentData<Node>(source.Node).m_Position;
-                var profile = PolygonProfile(source);
+                var styled = median.Halves[0].Source;
+                var profile = PolygonProfile(styled);
                 if (median.Saved.CurbWidth > 0)
                 {
                     float scale = median.Saved.CurbWidth / profile.CurbWidth;
@@ -391,7 +435,7 @@ namespace RoadGrass
                 }
                 bool grass = median.Saved.Surface == MedianSavedSurface.Grass ||
                     (median.Saved.Surface == MedianSavedSurface.None &&
-                    (source.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
+                    (styled.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
                 var projection = GetPolygonHeightProjection(source);
                 float3 ProjectFoot(float3 p) => (projection == null ? p : projection(p)) + new float3(0, profile.BaseHeight, 0);
                 var mesh = RoadGrassPolygonPrototypeMesh.Build(loops, origin, profile, ProjectFoot, grass);
@@ -410,7 +454,7 @@ namespace RoadGrass
                     for (int sample = 0; sample < samples; sample++) outline.Add(new Line3.Segment(At(sample), At(sample + 1)));
                 }
                 RoadGrassPolygonPrototypeResources.CopyMedianMaterials(EntityManager,
-                    World.GetExistingSystemManaged<PrefabSystem>(), source, out var pavementMaterial, out var grassMaterial, out var materialTextures);
+                    World.GetExistingSystemManaged<PrefabSystem>(), styled, out var pavementMaterial, out var grassMaterial, out var materialTextures);
                 renderer.Submit(id, median.Sections, median.Saved.Surface, mesh, origin, grass, outline,
                     pavementMaterial, grassMaterial, materialTextures);
                 return true;

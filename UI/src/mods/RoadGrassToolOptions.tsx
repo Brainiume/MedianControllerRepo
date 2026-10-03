@@ -19,7 +19,9 @@ const surface$ = bindValue<number>(mod.id, "EditSurfaceChoice");
 const filters$ = bindValue<number>(mod.id, "ResetFilters");
 const active$ = bindValue<boolean>(mod.id, "IsActive");
 const selectedManual$ = bindValue<number>(mod.id, "SelectedManualMedianId");
+const selectedPolygon$ = bindValue<boolean>(mod.id, "SelectedIsPolygon");
 const snapping$ = bindValue<boolean>(mod.id, "PolygonSnapping");
+const placingPolygonPoints$ = bindValue<boolean>(mod.id, "PlacingPolygonPoints");
 const polygonExtend$ = bindValue<boolean>(mod.id, "PolygonExtendFromMedian");
 const tooltipStyle = getModule(
   "game-ui/common/tooltip/description-tooltip/description-tooltip.module.scss", "classes"
@@ -39,7 +41,9 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
   const active = useValue(active$);
   const mode = useValue(mode$);
   const selectedManual = useValue(selectedManual$);
+  const selectedPolygon = useValue(selectedPolygon$);
   const snapping = useValue(snapping$);
+  const placingPolygonPoints = useValue(placingPolygonPoints$);
   const polygonExtend = useValue(polygonExtend$);
   const cap = useValue(cap$);
   const surface = useValue(surface$);
@@ -61,10 +65,10 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
   );
   const rows = [
     <Section key="mode" title={title("ToolMode", "Median Controller")}>
-      {button("Connect", "Connect", "Connect two compatible median endpoints. Right-click cancels a selection or removes the complete connection.", connectIcon, mode === 0, "SetActiveMode", 0)}
+      {button("Connect", "Connect", "Connect two compatible median endpoints. The secondary action cancels a selection or removes the complete connection.", connectIcon, mode === 0, "SetActiveMode", 0)}
       {button("Edit", "Edit", "Edit a segment median surface, or apply the cap and surface together at an endpoint.", "coui://uil/Standard/Pencil.svg", mode === 1, "SetActiveMode", 1)}
       {button("Reset", "Reset", "Reset the highlighted segment surface, or the selected categories at an endpoint.", "coui://uil/Standard/XClose.svg", mode === 2, "SetActiveMode", 2)}
-      {button("ManualContour", "Contour", "Select an existing median's style, then draw polygon corners anywhere on the road. Lane and marking snaps are optional. Click the first corner to finish. Right-click undoes the last corner, cancels an empty drawing, or removes a placed median.", polygonIcon, mode === 3, "SetActiveMode", 3)}
+      {button("ManualContour", "Contour", "Select an existing median's style, then draw polygon corners anywhere on the road. Lane and marking snaps are optional. Select the first corner to finish. The secondary action undoes the last corner, cancels an empty drawing, or removes a placed median.", polygonIcon, mode === 3, "SetActiveMode", 3)}
     </Section>
   ];
   if (mode === 1 && !selectedManual) rows.push(
@@ -77,11 +81,15 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
       {button("Plain", "Plain", "Remove grass from the highlighted segment median.", plainIcon, surface === 1, "SetEditSurfaceChoice", 1)}
     </Section>
   );
-    if (mode === 3) {
+    if (mode === 3 && !(selectedManual && selectedPolygon)) {
         rows.push(
             <Section key="polygonExtend" title={title("PolygonExtendFromMedian", "Extend from median")}>
                 {button("PolygonExtendFromMedian", "Extend from median", "Open the joining curb and remove the original median end cap where the polygon joins its two end corners. Turn off to keep the polygon closed.", connectIcon, polygonExtend, "SetPolygonExtendFromMedian", !polygonExtend)}
-            </Section>,
+            </Section>
+        );
+    }
+    if (mode === 3 && placingPolygonPoints) {
+        rows.push(
             <Section key="polygonSnapping" title={title("Snapping", "Snapping")}>
                 {button("PolygonSnapping", "Snapping", "Toggle lane, marking and median-corner snapping. Closing the polygon stays available when snapping is off.", polygonIcon, snapping, "SetPolygonSnapping", !snapping)}
             </Section>

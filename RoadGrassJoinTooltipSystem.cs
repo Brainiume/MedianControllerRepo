@@ -1,4 +1,5 @@
 using Game;
+using Game.Input;
 using Game.Tools;
 using Game.UI.Localization;
 using Game.UI.Tooltip;
@@ -78,38 +79,57 @@ namespace RoadGrass
             AddMouseTooltip(new StringTooltip
             {
                 path = $"RoadGrass.JoinMedian.{state}",
-                icon = GetInputIcon(state),
                 value = LocalizedString.IdWithFallback(localeKey, fallback),
                 color = color
             });
+            AddInputHint(GetInputAction(state));
             if (state == RoadGrassJoinTooltipState.SelectManualMedian)
+            {
                 AddMouseTooltip(new StringTooltip
                 {
                     path = "RoadGrass.JoinMedian.RemoveManualMedian",
-                    icon = "Media/Mouse/RMB.svg",
                     value = LocalizedString.IdWithFallback("RoadGrass.MANUAL[RemoveHint]", "Remove only this manual median")
                 });
+                AddInputHint(m_JoinToolSystem.SecondaryApplyInput);
+            }
             if (m_JoinToolSystem.HasPendingSelection && state != RoadGrassJoinTooltipState.SelectedAgain)
             {
                 AddMouseTooltip(new StringTooltip
                 {
                     path = "RoadGrass.JoinMedian.CancelSelection",
-                    icon = "Media/Mouse/RMB.svg",
                     value = m_JoinToolSystem.HasPolygonCorners
                         ? LocalizedString.IdWithFallback("RoadGrass.MOUSE_TOOLTIP[UndoPolygonPoint]", "Remove last polygon corner")
                         : LocalizedString.IdWithFallback("RoadGrass.MOUSE_TOOLTIP[CancelSelection]", "Cancel selection")
                 });
+                AddInputHint(m_JoinToolSystem.SecondaryApplyInput);
             }
         }
 
-        private static string GetInputIcon(RoadGrassJoinTooltipState state)
+        private void AddInputHint(IProxyAction input)
+        {
+            if (input == null) return;
+            var device = InputManager.instance.activeControlScheme == InputManager.ControlScheme.KeyboardAndMouse
+                ? InputManager.DeviceType.Keyboard | InputManager.DeviceType.Mouse : InputManager.DeviceType.Gamepad;
+            void Add(ProxyAction action)
+            {
+                if (!action.enabled) return;
+                var hint = new InputHintTooltip(action);
+                hint.Refresh(device);
+                AddMouseTooltip(hint);
+            }
+            if (input is ProxyAction action) Add(action);
+            else if (input is UIBaseInputAction.IState state)
+                foreach (var actionState in state.actions) Add(actionState);
+        }
+
+        private IProxyAction GetInputAction(RoadGrassJoinTooltipState state)
         {
             switch (state)
             {
                 case RoadGrassJoinTooltipState.RemoveLinked:
                 case RoadGrassJoinTooltipState.SelectedAgain:
                 case RoadGrassJoinTooltipState.RemovePolygon:
-                    return "Media/Mouse/RMB.svg";
+                    return m_JoinToolSystem.SecondaryApplyInput;
                 case RoadGrassJoinTooltipState.EditSegment:
                 case RoadGrassJoinTooltipState.PickTaperStart:
                 case RoadGrassJoinTooltipState.SelectManualMedian:
@@ -123,7 +143,7 @@ namespace RoadGrass
                 case RoadGrassJoinTooltipState.SelectFirstHovered:
                 case RoadGrassJoinTooltipState.AutoConnect:
                 case RoadGrassJoinTooltipState.ValidSecond:
-                    return "Media/Mouse/LMB.svg";
+                    return m_JoinToolSystem.ApplyInput;
                 default:
                     return null;
             }

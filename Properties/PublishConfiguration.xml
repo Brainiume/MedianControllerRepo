@@ -4,24 +4,48 @@
 	<!--Name of the mod to display to players-->
 	<DisplayName Value="Median Controller" />
 	<!--Short description of the mod-->
-	<ShortDescription Value="Restore and connect grass medians around road junctions and transport stops." />
+	<ShortDescription Value="Create, connect and modify medians along roads in intersections and at transit stops." />
 	<!--Long description of the mod. Single line or multi line. Supports minimal markdown subset-->
 	<!--LongDescription Value="This is a long description" /-->
 	<LongDescription>
-Median Controller restores grass median pieces removed around transport stops and connects compatible median pieces across road junctions. It supports different road prefabs and widths, can return selected roads to their original appearance, and includes a settings action for removing all Median Controller data from the current city.
+		# Median Controller
+		---------------------
+		# !!Closed Beta Version!!
+		# !!Expect Bugs and possible crashes; report any on discord channel!!
+
+		# Features
+
+		- Connect median endpoints through intersections, including medians with different widths.
+		- Edit road medians with Rounded or Straight end caps.
+		- Modify center median to be Grass or Pavement regardless of transit stop precence.
+		- Draw custom polygon medians using an existing median's style, with lane, road-marking and median-corner snapping.
+		- Select and edit created polygon medians, including their surface, curb width, offsets and corner rounding.
+		- Keep median edits and custom polygons when saving and reloading your city.
+
+		# Compatiblity
+		Tested working with:
+		- Road Builder 
+		- Traffic 
+		
+		Currently no incompatible mods have been reported/found.
+		
+		Paradox Forum and Source Code to be Linked upon public release. 
 	</LongDescription>
 	<!--Thumbnail-->
 	<Thumbnail Value="Properties/Thumbnail.png" />
+	<Screenshot Value="Properties/10CustomMedians.jpg" />
+	<Screenshot Value="Properties/20JoinMedians.jpg" />
+	<Screenshot Value="Properties/30EndcapsSurfaces.jpg" />
 	<!--Screenshot, can be set multiple times-->
 	<Screenshot Value="" />
 	<!--Tag, can be set multiple times-->
-	<Tag Value="" />
+	<Tag Value="Code Mod" />
 	<!--Link to the forum post where the mod can be discussed-->
 	<ForumLink Value="" />
 	<!--Version of the mod-->
-	<ModVersion Value="1.0" />
+	<ModVersion Value="0.1.0" />
 	<!--Recommended version of the base game to use the mod-->
-	<GameVersion Value="1.0.*" />
+	<GameVersion Value="1.6.*" />
 	<!--Dependency for the mod, can be set multiple times-->
 	<Dependency Id="" />
 	<!--Required DLC, can be set multiple times. Supported values are "Landmark Buildings", "San Fransisco Set", "Beach Properties", "Urban Promenades", "Modern Architecture"-->
@@ -31,7 +55,7 @@ Median Controller restores grass median pieces removed around transport stops an
 	<!--<ChangeLog>
 	</ChangeLog>-->
 	<!--External link, can be set multiple times. supported types are "discord", "github", "youtube", "twitch", "x", "paypal", "patreon", "buymeacoffee", "kofi", "crowdin", "gitlab", "gofundme"-->
-	<ExternalLink Type="" Url="" />
+	<ExternalLink Type="discord" Url="https://discord.gg/HTav7ARPs2"/>
 	<!--Supported values Public, Private, Unlisted-->
-	<AccessLevel Value="Public" />
+	<AccessLevel Value="Unlisted" />
 </Publish>
