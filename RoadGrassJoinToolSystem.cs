@@ -170,10 +170,6 @@ namespace RoadGrass
             bool hitRoad = false;
             Entity overlayNode = Entity.Null;
             RoadGrassResolvedMedianAnchor selectedFirst = null;
-            if (m_FirstAnchor.HasValue && manager != null)
-            {
-                manager.TryResolveAnchor(m_FirstAnchor.Value, out selectedFirst);
-            }
 
             bool hasRoadRaycast =
                 GetRaycastResult(out Entity hitEntity, out RaycastHit hit);
@@ -181,6 +177,34 @@ namespace RoadGrass
             bool hasCursorRay = TryGetCursorRay(
                 out Line3.Segment cursorRay,
                 out float fovTan);
+
+            // Custom meshes are not vanilla road-raycast targets. Pick them before endpoint
+            // resolution, and use the same interaction in every mode that manages them.
+            bool managesManual = Options.ActiveMode == MedianControllerMode.Edit || Options.ActiveMode == MedianControllerMode.Reset ||
+                (Options.ActiveMode == MedianControllerMode.Polygon && !HasPolygonCorners);
+            if (manager != null && managesManual && hasCursorRay)
+            {
+                int manual = PickManualMedian(manager, cursorRay, fovTan);
+                if (manual != 0)
+                {
+                    bool reset = Options.ActiveMode == MedianControllerMode.Reset;
+                    TooltipState = reset ? RoadGrassJoinTooltipState.ResetManualMedian : RoadGrassJoinTooltipState.SelectManualMedian;
+                    if (secondaryApplyAction.WasReleasedThisFrame() || (reset && applyAction.WasReleasedThisFrame()))
+                    {
+                        ClearTransientSelection();
+                        manager.RemoveManualMedian(manual);
+                    }
+                    else if (applyAction.WasReleasedThisFrame())
+                    {
+                        ClearTransientSelection();
+                        manager.SelectManualMedian(manual);
+                    }
+                    return DrawManualMedianSelection(inputDeps, manager, manual);
+                }
+            }
+
+            if (m_FirstAnchor.HasValue && manager != null)
+                manager.TryResolveAnchor(m_FirstAnchor.Value, out selectedFirst);
 
             if (manager != null && selectedFirst != null && hasCursorRay)
             {
@@ -260,17 +284,6 @@ namespace RoadGrass
                 return UpdatePolygon(inputDeps, manager, hovered, overlayNode, hasCursorRay, cursorRay, fovTan);
             if (manager != null && (Options.ActiveMode == MedianControllerMode.Edit || Options.ActiveMode == MedianControllerMode.Reset))
             {
-                int manual = hasCursorRay ? PickManualMedian(manager, cursorRay, fovTan) : 0;
-                if (manual != 0)
-                {
-                    bool reset = Options.ActiveMode == MedianControllerMode.Reset;
-                    TooltipState = reset ? RoadGrassJoinTooltipState.ResetManualMedian : RoadGrassJoinTooltipState.SelectManualMedian;
-                    if (secondaryApplyAction.WasReleasedThisFrame() || (reset && applyAction.WasReleasedThisFrame()))
-                        manager.RemoveManualMedian(manual);
-                    else if (applyAction.WasReleasedThisFrame())
-                        manager.SelectManualMedian(manual);
-                    return DrawManualMedianSelection(inputDeps, manager, manual);
-                }
                 if (hasCursorRay && applyAction.WasReleasedThisFrame()) manager.SelectManualMedian(0);
                 if (manager.SelectedManualMedianId != 0)
                     inputDeps = DrawManualMedianSelection(inputDeps, manager, 0);

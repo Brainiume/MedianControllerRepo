@@ -20,6 +20,14 @@ namespace RoadGrass
             int hit = 0;
             float nearest = float.MaxValue;
             foreach (int id in manager.ManualMediansAtNode(Entity.Null))
+            {
+                var renderer = RoadGrassPolygonPrototypeBatchSystem.Instance;
+                if (renderer?.HasPickGeometry(id) == true)
+                {
+                    if (renderer.TryPick(id, ray, out float score) && score < nearest)
+                    { nearest = score; hit = id; }
+                    continue;
+                }
             foreach (var outline in manager.GetManualOutlines(id))
             {
                 bool a = RoadGrassPolygonSections.RayHit(outline.m_Start, ray, out float sa);
@@ -29,16 +37,26 @@ namespace RoadGrass
                 nearest = score;
                 hit = id;
             }
+            }
             return hit;
+        }
+
+        private void AddManualMedianOutline(ref NativeList<OverlayCommand> commands, RoadGrassJoinCompositionSystem manager, int id, Color color)
+        {
+            var renderer = RoadGrassPolygonPrototypeBatchSystem.Instance;
+            if (renderer?.HasPickGeometry(id) == true)
+            {
+                foreach (var line in renderer.GetPickOutline(id)) AddLine(ref commands, color, line, OutlineWidth);
+            }
+            else
+                foreach (var outline in manager.GetManualOutlines(id)) AddPreviewHalf(ref commands, outline, color);
         }
 
         private JobHandle DrawManualMedianSelection(JobHandle inputDeps, RoadGrassJoinCompositionSystem manager, int hovered)
         {
             var commands = new NativeList<OverlayCommand>(Allocator.TempJob);
-            foreach (var outline in manager.GetManualOutlines(manager.SelectedManualMedianId))
-                AddPreviewHalf(ref commands, outline, SelectedColor);
-            foreach (var outline in manager.GetManualOutlines(hovered))
-                AddPreviewHalf(ref commands, outline, HoverColor);
+            AddManualMedianOutline(ref commands, manager, manager.SelectedManualMedianId, SelectedColor);
+            AddManualMedianOutline(ref commands, manager, hovered, HoverColor);
             var buffer = m_OverlayRenderSystem.GetBuffer(out JobHandle dependencies);
             var result = new DrawOverlayJob { Commands = commands.AsArray(), Buffer = buffer }
                 .Schedule(JobHandle.CombineDependencies(inputDeps, dependencies));
@@ -55,12 +73,10 @@ namespace RoadGrass
             if (source == null) { m_PolygonPoints.Clear(); m_PolygonCornerStarts.Clear(); m_PolygonCornerSnaps.Clear(); }
             if (source != null) node = source.Node;
             var commands = new NativeList<OverlayCommand>(Allocator.TempJob);
-            int hit = source == null && hasRay ? PickManualMedian(manager, ray, fovTan) : 0;
             RoadGrassResolvedMedianAnchor extension = null;
             float nearest = float.MaxValue;
-            foreach (var selected in manager.GetManualOutlines(manager.SelectedManualMedianId)) AddPreviewHalf(ref commands, selected, SelectedColor);
-            foreach (var highlight in manager.GetManualOutlines(hit)) AddPreviewHalf(ref commands, highlight, HoverColor);
-            if(source==null&&hasRay&&hit==0)
+            AddManualMedianOutline(ref commands, manager, manager.SelectedManualMedianId, SelectedColor);
+            if(source==null&&hasRay)
                 foreach(var candidate in manager.GetNodeAnchors(node))
                 {
                     if(!manager.HasExtension(candidate)||!manager.TryBuildTaperPreview(candidate,out var outline))continue;
@@ -88,13 +104,12 @@ namespace RoadGrass
             else if (source == null)
             {
                 bool available = manager.CanDrawPolygon(hovered);
-                TooltipState = hit != 0 ? RoadGrassJoinTooltipState.SelectManualMedian : available ?
+                TooltipState = available ?
                     RoadGrassJoinTooltipState.PickTaperStart : RoadGrassJoinTooltipState.SelectTaperStart;
-                if (hovered != null && hit == 0) AddFootprint(ref commands, hovered, available ? HoverColor : InvalidColor);
+                if (hovered != null) AddFootprint(ref commands, hovered, available ? HoverColor : InvalidColor);
                 if (applyAction.WasReleasedThisFrame())
                 {
-                    if (hit != 0) manager.SelectManualMedian(hit);
-                    else if (available) { manager.SelectManualMedian(0); m_FirstAnchor = hovered.Key; m_PolygonPoints.Clear(); }
+                    if (available) { manager.SelectManualMedian(0); m_FirstAnchor = hovered.Key; m_PolygonPoints.Clear(); }
                 }
             }
             else
@@ -106,21 +121,30 @@ namespace RoadGrass
                 if (RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, source, out var opening))
                 { if (Options.PolygonSnapping) { points.Insert(0, opening.m_Right.d); points.Insert(0, opening.m_Left.d); } }
                 float3 delta = ray.b - ray.a;
-                snapped = PickPolygonSnap(points, ray, hasRay, fovTan, ref commands, out destination);
+                if (Options.PolygonSnapping)
+                    snapped = PickPolygonSnap(points, ray, hasRay, fovTan, ref commands, out destination);
+                else
+                { m_PolygonSnapTarget = null; m_PolygonHoverGroup = -1; }
                 bool closing = false;
                 if (hasRay && m_PolygonCornerStarts.Count >= 3)
                 {
                     float3 first = m_PolygonPoints[0];
                     float t = math.dot(first - ray.a, delta) / math.max(.0001f, math.lengthsq(delta));
                     float tolerance = math.clamp(math.distance(ray.a, first) * fovTan * .003f, .2f, .45f);
-                    closing = t >= 0 && t <= 1 && math.distance(first, ray.a + delta * t) <= tolerance;
-                    if (closing) { destination = first; snapped = true; }
+                    closing = (Options.PolygonSnapping || applyAction.WasReleasedThisFrame()) &&
+                        t >= 0 && t <= 1 && math.distance(first, ray.a + delta * t) <= tolerance;
+                    if (closing && Options.PolygonSnapping) { destination = first; snapped = true; }
                 }
                 bool hasPosition = hasRay && snapped;
                 if (hasRay && !snapped)
                 {
                     if (GetRaycastResult(out Entity _, out Game.Common.RaycastHit roadHit))
-                    { destination = roadHit.m_Position; hasPosition = true; }
+                    {
+                        // m_Position is the road centreline/node, not the cursor's surface hit.
+                        // Intersect the current cursor ray at the hit height so delayed raycast results cannot shift the point sideways.
+                        float t = math.abs(delta.y) > .0001f ? (roadHit.m_HitPosition.y - ray.a.y) / delta.y : -1;
+                        if (t >= 0 && t <= 1) { destination = ray.a + delta * t; hasPosition = true; }
+                    }
                     else if (math.abs(delta.y) > .0001f && manager.TryGetTaperStart(source, out var start))
                     {
                         float height = m_PolygonPoints.Count == 0 ? start.y : m_PolygonPoints[0].y;
@@ -145,7 +169,7 @@ namespace RoadGrass
                     }
                     else if (!closing) candidate.Add(destination);
                 }
-                bool valid = candidate.Count >= 3 && manager.TryPolygonPreview(source, candidate, surface, out _);
+                bool valid = candidate.Count >= 3 && manager.TryPolygonPreview(source, candidate, surface, out _, Options.PolygonExtendFromMedian);
                 TooltipState = closing && valid ? RoadGrassJoinTooltipState.ClosePolygon :
                     candidate.Count >= 3 && !valid ? RoadGrassJoinTooltipState.ManualGuideRejected : RoadGrassJoinTooltipState.AddPolygonPoint;
                 for (int i = 0; i < candidate.Count; i++)
@@ -157,7 +181,7 @@ namespace RoadGrass
                 }
                 if (candidate.Count >= 3) AddLine(ref commands, closing && valid ? ValidColor : HoverColor,
                     new Line3.Segment(candidate[candidate.Count - 1], candidate[0]), OutlineWidth);
-                if (closing && valid && manager.TryPolygonPreview(source, candidate, surface, out var preview))
+                if (closing && valid && manager.TryPolygonPreview(source, candidate, surface, out var preview, Options.PolygonExtendFromMedian))
                     foreach (var half in preview)
                         AddPreviewHalf(ref commands, RoadGrassJoinCompositionSystem.BuildEdgeGeometry(half.Geometry.m_Left.m_Left, half.Geometry.m_Right.m_Right), ValidColor);
                 if (applyAction.WasReleasedThisFrame() && hasPosition)
@@ -168,7 +192,7 @@ namespace RoadGrass
                         int corner = m_PolygonCornerStarts.IndexOf(i);
                         references.Add(corner >= 0 ? m_PolygonCornerSnaps[corner] : Options.PolygonSnapping);
                     }
-                    if (closing && valid && manager.PlacePolygon(source, candidate, surface, references))
+                    if (closing && valid && manager.PlacePolygon(source, candidate, surface, references, Options.PolygonExtendFromMedian))
                     {
                         int selected = manager.SelectedManualMedianId;
                         Options.SetActiveMode((int)MedianControllerMode.Edit);

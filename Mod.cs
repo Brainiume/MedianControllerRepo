@@ -69,12 +69,16 @@ namespace RoadGrass
                 Game.Rendering.BatchDataSystem>(
                 SystemUpdatePhase.Rendering);
 
+            updateSystem.UpdateBefore<RoadGrassPolygonPrototypeBatchSystem, Game.Rendering.ManagedBatchSystem>(SystemUpdatePhase.Rendering);
+            updateSystem.UpdateBefore<RoadGrassPolygonPrototypeDataSystem, Game.Rendering.BatchDataSystem>(SystemUpdatePhase.Rendering);
+
             updateSystem.UpdateBefore<RoadGrassJoinSaveRestoreSystem, BeginPrefabSerializationSystem>(SystemUpdatePhase.Serialize);
             updateSystem.UpdateAfter<RoadGrassJoinSaveReapplySystem, WriteSystem>(SystemUpdatePhase.Serialize);
         }
 
         public void OnDispose()
         {
+            RoadGrassPolygonPrototypeBatchSystem.Instance?.Shutdown();
             m_Settings?.UnregisterInOptionsUI();
             m_Settings = null;
             TryInfo(nameof(OnDispose));

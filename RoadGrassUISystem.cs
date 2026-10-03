@@ -28,7 +28,10 @@ namespace RoadGrass
         private ValueBinding<bool> m_IsActiveBinding;
         private ValueBinding<bool> m_ExtendBinding;
         private ValueBinding<bool> m_SnappingBinding;
+        private ValueBinding<bool> m_PolygonExtendBinding;
+        private ValueBinding<float> m_PolygonCurbWidthBinding;
         internal bool PolygonSnapping { get; private set; } = true;
+        internal bool PolygonExtendFromMedian { get; private set; } = true;
         private ValueBinding<int> m_SelectedManualBinding, m_ManualSurfaceBinding;
         private ValueBinding<bool> m_CanEditManualBinding;
         private ValueBinding<string> m_ManualMessageBinding;
@@ -53,6 +56,13 @@ namespace RoadGrass
             AddBinding(m_SnappingBinding = new ValueBinding<bool>(ModId, "PolygonSnapping", PolygonSnapping));
             AddBinding(new TriggerBinding<bool>(ModId, "SetPolygonSnapping", value =>
             { PolygonSnapping = value; m_SnappingBinding.Update(value); }));
+            AddBinding(m_PolygonExtendBinding = new ValueBinding<bool>(ModId, "PolygonExtendFromMedian", PolygonExtendFromMedian));
+            AddBinding(new TriggerBinding<bool>(ModId, "SetPolygonExtendFromMedian", value =>
+            {
+                PolygonExtendFromMedian = value;
+                RoadGrassJoinCompositionSystem.Instance?.SetPolygonExtend(value);
+                m_PolygonExtendBinding.Update(value);
+            }));
             AddBinding(m_SelectedManualBinding = new ValueBinding<int>(ModId, "SelectedManualMedianId", 0));
             AddBinding(m_ManualSurfaceBinding = new ValueBinding<int>(ModId, "SelectedManualMedianSurface", 0));
             AddBinding(m_CanEditManualBinding = new ValueBinding<bool>(ModId, "CanEditSelectedManualMedian", false));
@@ -64,6 +74,8 @@ namespace RoadGrass
             AddBinding(m_LineRadiusBinding = new ValueBinding<float>(ModId, "PolygonLineRadius", 0));
             AddBinding(m_MedianRadiusBinding = new ValueBinding<float>(ModId, "PolygonMedianRadius", 0));
             AddBinding(m_OffsetLimitBinding = new ValueBinding<float>(ModId, "PolygonOffsetLimit", 1));
+            AddBinding(m_PolygonCurbWidthBinding = new ValueBinding<float>(ModId, "PolygonCurbWidth", .12f));
+            AddBinding(new TriggerBinding<float>(ModId, "SetPolygonCurbWidth", value => RoadGrassJoinCompositionSystem.Instance?.SetPolygonCurbWidth(value)));
             AddBinding(new TriggerBinding<int, float>(ModId, "SetPolygonShape", (field, value) => RoadGrassJoinCompositionSystem.Instance?.SetPolygonShape(field, value)));
             AddBinding(new TriggerBinding<int>(ModId, "SetManualMedianSurface", value =>
             {
@@ -155,11 +167,13 @@ namespace RoadGrass
             m_CanEditManualBinding.Update(manager?.CanEditSelectedManualMedian ?? false);
             m_ManualMessageBinding.Update(manager?.ManualMessage ?? "");
             m_PolygonSelectedBinding.Update(manager?.SelectedIsPolygon ?? false);
+            m_PolygonExtendBinding.Update(manager?.SelectedIsPolygon == true ? manager.SelectedPolygonExtend : PolygonExtendFromMedian);
             m_PolygonOpeningBinding.Update(manager?.SelectedPolygonHasOpening ?? false);
             var shape = manager?.SelectedPolygonShape ?? default;
             m_LineOffsetBinding.Update(shape.x); m_MedianOffsetBinding.Update(shape.y);
             m_LineRadiusBinding.Update(shape.z); m_MedianRadiusBinding.Update(shape.w);
             m_OffsetLimitBinding.Update(manager?.SelectedPolygonOffsetLimit ?? 1);
+            m_PolygonCurbWidthBinding.Update(manager?.SelectedPolygonCurbWidth ?? .12f);
         }
 
         [Preserve]

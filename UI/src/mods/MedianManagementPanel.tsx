@@ -6,6 +6,7 @@ import { VanillaComponentResolver } from "./VanillaComponentResolver";
 import grass from "../icons/grass.svg";
 import plain from "../icons/plain.svg";
 import reset from "../icons/all.svg";
+import connect from "../icons/connect.svg";
 
 const selected$ = bindValue<number>(mod.id, "SelectedManualMedianId");
 const surface$ = bindValue<number>(mod.id, "SelectedManualMedianSurface");
@@ -19,6 +20,8 @@ const lineRadius$ = bindValue<number>(mod.id, "PolygonLineRadius");
 const medianRadius$ = bindValue<number>(mod.id, "PolygonMedianRadius");
 const offsetLimit$ = bindValue<number>(mod.id, "PolygonOffsetLimit");
 const snapping$ = bindValue<boolean>(mod.id, "PolygonSnapping");
+const polygonExtend$ = bindValue<boolean>(mod.id, "PolygonExtendFromMedian");
+const curbWidth$ = bindValue<number>(mod.id, "PolygonCurbWidth");
 
 export const MedianManagementPanel = () => {
     const selected = useValue(selected$), surface = useValue(surface$);
@@ -27,6 +30,8 @@ export const MedianManagementPanel = () => {
     const values = [useValue(lineOffset$), useValue(medianOffset$), useValue(lineRadius$), useValue(medianRadius$)];
     const offsetLimit = useValue(offsetLimit$);
     const snapping = useValue(snapping$);
+    const polygonExtend = useValue(polygonExtend$);
+    const curbWidth = useValue(curbWidth$);
     const { translate } = useLocalization();
     const { Section, ToolButton, toolButtonTheme, FOCUS_DISABLED, Slider, sliderTheme } = VanillaComponentResolver.instance;
     const panel = useRef<HTMLElement>(null);
@@ -45,7 +50,7 @@ export const MedianManagementPanel = () => {
     if (!selected && !message) return null;
     const label = (key: string, fallback: string) => translate(`RoadGrass.MANUAL[${key}]`, fallback);
     const field = (index: number, name: string) => {
-        const max = index < 2 ? offsetLimit : 10;
+        const max = offsetLimit;
         const set = (value: number) => { if (Number.isFinite(value)) trigger(mod.id, "SetPolygonShape", index, Math.min(max, Math.max(0, Math.round(value * 10) / 10))); };
         return <div role="group" aria-label={name} style={{marginTop: "10rem"}}
             onWheel={event => { event.preventDefault(); if (editable) set(values[index] + (event.deltaY < 0 ? .1 : -.1)); }}>
@@ -70,7 +75,6 @@ export const MedianManagementPanel = () => {
                     <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={reset} selected={snapping}
                         aria-label={label("Snapping", "Snapping")} tooltip={label("SnappingHint", "Turn snapping on or off when drawing polygon points")}
                         onSelect={() => trigger(mod.id, "SetPolygonSnapping", !snapping)} />
-                    <span>{snapping ? label("On", "On") : label("Off", "Off")}</span>
                 </Section>
                 <Section title={label("Surface", "Surface")}>
                     {action("Grass", "Grass", grass, 1)}
@@ -85,12 +89,28 @@ export const MedianManagementPanel = () => {
             </>}
             {!!message && <div role="status" style={{fontSize: "13rem", marginTop: "8rem", whiteSpace: "normal"}}>{message}</div>}
         {polygon && <div>
+            <Section title={label("ExtendFromMedian", "Extend from median")}>
+                <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={connect} selected={polygonExtend}
+                    aria-label={label("ExtendFromMedian", "Extend from median")}
+                    tooltip={label("ExtendFromMedianHint", "Open the joining curb and remove the original median end cap where this polygon joins its two end corners")}
+                    aria-disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonExtendFromMedian", !polygonExtend)} />
+            </Section>
             {field(0, opening ? label("LineOffset", "Line offset") : label("Offset", "Offset"))}
             {opening && field(1, label("MedianOffset", "Median offset"))}
             {field(2, opening ? label("LineRadius", "Line corner radius") : label("Radius", "Corner radius"))}
             {opening && field(3, label("MedianRadius", "Median corner radius"))}
+            <div role="group" aria-label={label("CurbWidth", "Curb width")} style={{marginTop: "10rem"}}>
+                <div style={{display: "flex", justifyContent: "space-between", marginBottom: "6rem"}}>
+                    <span>{label("CurbWidth", "Curb width")}</span><span>{curbWidth.toFixed(2)} m</span>
+                </div>
+                <Slider start={.03} end={1} value={curbWidth} disabled={!editable} theme={sliderTheme}
+                    onChange={value => editable && Number.isFinite(value) && trigger(mod.id, "SetPolygonCurbWidth", Math.round(value * 100) / 100)} />
+                <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={reset}
+                    aria-label={label("ResetCurb", "Reset curb width")} tooltip={label("ResetCurbHint", "Restore the original median prefab's curb width")}
+                    aria-disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonCurbWidth", 0)} />
+            </div>
             <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={reset}
-                aria-label={label("ResetShape", "Reset Shape")} tooltip={label("ResetShapeHint", "Reset offsets and corner radii; keep the selected surface")}
+                aria-label={label("ResetShape", "Reset Shape")} tooltip={label("ResetShapeHint", "Reset offsets, corner radii and curb width; keep the selected surface")}
                 aria-disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonShape", -1, 0)} />
         </div>}
         </aside>

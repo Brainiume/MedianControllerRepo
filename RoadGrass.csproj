@@ -46,6 +46,12 @@
 		<Reference Include="UnityEngine.CoreModule">
 			<Private>false</Private>
 		</Reference>
+		<Reference Include="Unity.RenderPipelines.HighDefinition.Runtime">
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.AssetBundleModule">
+			<Private>false</Private>
+		</Reference>
 		<Reference Include="Unity.Burst">
 			<Private>false</Private>
 		</Reference>
@@ -75,6 +81,10 @@
 	<ItemGroup>
 		<None Include="$(ModPropsFile)" Link="Properties\Mod.props" />
 		<None Include="$(ModTargetsFile)" Link="Properties\Mod.targets" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<EmbeddedResource Include="Assets\PolygonMedian\mediancontroller-polygon" LogicalName="RoadGrass.PolygonMedianShader" />
 	</ItemGroup>
 
 	<Target Name="InstallUI" AfterTargets="AfterBuild">

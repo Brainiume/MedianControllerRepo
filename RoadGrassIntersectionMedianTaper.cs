@@ -63,6 +63,7 @@ namespace RoadGrass
             m_PolygonPreviewPoints = null;
             m_PolygonGuides.Clear(); m_PolygonGuideEdges.Clear();
             m_PolygonRoadSurfaces.Clear();
+            m_PolygonProfiles.Clear();
             m_MarkingGuides.Clear();
             m_TaperPlans.Clear();
             m_TaperDependencies.Clear();

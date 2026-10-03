@@ -54,7 +54,7 @@ namespace RoadGrass
             return result;
         }
 
-        private static Loop Offset(Loop input, float line, float median)
+        internal static Loop Offset(Loop input, float line, float median)
         {
             var result = new Loop();
             float sign = math.sign(Area(input.Points));

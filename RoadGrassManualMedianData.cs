@@ -13,22 +13,31 @@ namespace RoadGrass
         internal RoadGrassMedianAnchorData Anchor;
         internal MedianSavedSurface Surface;
         internal float4 Shape; // line/median offset, line/median radius
+        internal bool ExtendFromMedian;
+        internal float CurbWidth; // Zero inherits the source prefab width.
         internal RoadGrassMedianAnchorKey Key => new RoadGrassMedianAnchorKey(Edge, Anchor.End, Anchor.Ordinal);
         public void Serialize<T>(T writer) where T : IWriter
         {
-            writer.Write(2); writer.Write(Id); writer.Write(Node); writer.Write(Edge);
+            writer.Write(4); writer.Write(Id); writer.Write(Node); writer.Write(Edge);
             Anchor.Serialize(writer); writer.Write((int)Surface);
             writer.Write(Shape.x); writer.Write(Shape.y); writer.Write(Shape.z); writer.Write(Shape.w);
+            writer.Write(ExtendFromMedian);
+            writer.Write(CurbWidth);
         }
         public void Deserialize<T>(T reader) where T : IReader
         {
             reader.Read(out int version);
-            if (version < 1 || version > 2) throw new InvalidOperationException("Unsupported manual median version");
+            if (version < 1 || version > 4) throw new InvalidOperationException("Unsupported manual median version");
             reader.Read(out Id); reader.Read(out Node); reader.Read(out Edge);
             Anchor.Deserialize(reader); reader.Read(out int surface);
             Surface = surface >= 0 && surface <= 2 ? (MedianSavedSurface)surface : MedianSavedSurface.None;
             Shape = default;
             if (version >= 2) { reader.Read(out Shape.x); reader.Read(out Shape.y); reader.Read(out Shape.z); reader.Read(out Shape.w); }
+            ExtendFromMedian = true; // Existing polygons keep their automatic attachment behavior.
+            if (version >= 3) reader.Read(out ExtendFromMedian);
+            CurbWidth = 0;
+            if (version >= 4) reader.Read(out CurbWidth);
+            CurbWidth = math.isfinite(CurbWidth) ? math.clamp(CurbWidth, 0, 1) : 0;
             if (!math.all(math.isfinite(Shape))) Shape = default;
             Shape = math.clamp(Shape, 0, new float4(100, 100, 10, 10));
         }

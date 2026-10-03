@@ -40,6 +40,7 @@ namespace RoadGrass
 
         private void ResetManualRuntime()
         {
+            RoadGrassPolygonPrototypeBatchSystem.Instance?.Clear();
             m_ManualMedians.Clear(); m_ManualKeys.Clear(); m_ManualLoaded = false;
             m_PolygonRenderKeys.Clear();
             m_PolygonPreviewPoints = null;
@@ -242,6 +243,7 @@ namespace RoadGrass
             var vertices=EntityManager.GetBuffer<RoadGrassSavedManualMedianVertex>(city);
             for(int i=vertices.Length-1;i>=0;i--)if(vertices[i].Id==id)vertices.RemoveAt(i);
             m_ManualMedians.Remove(id);
+            RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
             if (median.Points.Count == 2) m_ManualKeys.Remove(median.Saved.Key);
             if(SelectedManualMedianId==id)SelectedManualMedianId=0;
             ClearTaperPlans();m_Dirty=true;ManualMessage="";

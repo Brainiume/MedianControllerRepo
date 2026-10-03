@@ -15,6 +15,7 @@ namespace RoadGrass
         private List<float3> m_PolygonPreviewPoints;
         private RoadGrassMedianAnchorKey m_PolygonPreviewKey;
         private MedianSavedSurface m_PolygonPreviewSurface;
+        private bool m_PolygonPreviewExtend;
         private List<RoadGrassTransitionMesh.Half> m_PolygonPreviewHalves;
         private bool m_PolygonPreviewValid;
         private string m_PolygonPreviewReason;
@@ -49,18 +50,19 @@ namespace RoadGrass
             !m_SuspendedForSave && !m_WaitingForLoadSettle && !m_CityQuery.IsEmptyIgnoreFilter;
 
         internal bool TryPolygonPreview(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points,
-            MedianSavedSurface surface, out List<RoadGrassTransitionMesh.Half> halves)
+            MedianSavedSurface surface, out List<RoadGrassTransitionMesh.Half> halves, bool extendFromMedian = true)
         {
             halves = null;
             if (!CanDrawPolygon(anchor)) return false;
             bool same = m_PolygonPreviewPoints != null && m_PolygonPreviewKey.Equals(anchor.Key) &&
-                m_PolygonPreviewSurface == surface && m_PolygonPreviewPoints.Count == points.Count;
+                m_PolygonPreviewSurface == surface && m_PolygonPreviewExtend == extendFromMedian && m_PolygonPreviewPoints.Count == points.Count;
             for (int i = 0; same && i < points.Count; i++) same = m_PolygonPreviewPoints[i].Equals(points[i]);
             if (!same)
             {
                 m_PolygonPreviewPoints = new List<float3>(points);
                 m_PolygonPreviewKey = anchor.Key; m_PolygonPreviewSurface = surface;
-                m_PolygonPreviewValid = TryCreatePolygon(anchor, points, surface, out m_PolygonPreviewHalves, out m_PolygonPreviewReason);
+                m_PolygonPreviewExtend = extendFromMedian;
+                m_PolygonPreviewValid = TryCreatePolygon(anchor, points, surface, out m_PolygonPreviewHalves, out m_PolygonPreviewReason, extendFromMedian);
             }
             halves = m_PolygonPreviewHalves;
             ManualMessage = m_PolygonPreviewValid ? "" : m_PolygonPreviewReason;
@@ -68,25 +70,26 @@ namespace RoadGrass
         }
 
         private bool TryCreatePolygon(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points,
-            MedianSavedSurface surface, out List<RoadGrassTransitionMesh.Half> halves, out string reason)
+            MedianSavedSurface surface, out List<RoadGrassTransitionMesh.Half> halves, out string reason, bool extendFromMedian)
         {
-            if (!TryPlanPolygon(anchor, points, default, out var sections, out _, out reason))
+            if (!TryPlanPolygon(anchor, points, default, out var sections, out _, out reason, extendFromMedian))
             { halves = null; return false; }
             return BindPolygonSurface(anchor, sections, surface, out halves, out reason);
         }
 
         private bool TryPlanPolygon(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points,
-            float4 shape, out List<RoadGrassPolygonSections.Section> sections, out bool attached, out string reason)
+            float4 shape, out List<RoadGrassPolygonSections.Section> sections, out bool attached, out string reason, bool extendFromMedian)
         {
             sections = new List<RoadGrassPolygonSections.Section>(); attached = false;
             reason = "Choose at least three polygon corners";
             if (!CanDrawPolygon(anchor) || points.Count < 3) return false;
-            var kinds = PolygonOpeningEdges(anchor, points);
-            var loops = RoadGrassPolygonShape.Build(points, kinds, shape);
+            var kinds = extendFromMedian ? PolygonOpeningEdges(anchor, points) : new bool[points.Count];
+            foreach (bool kind in kinds) attached |= kind;
+            var loops = BuildPolygonLoops(anchor, points, kinds, shape, extendFromMedian);
             foreach (var loop in loops)
             {
                 float2? direction = null;
-                if (TryPolygonAttachment(anchor, loop.Points, out var opening))
+                if (extendFromMedian && TryPolygonAttachment(anchor, loop.Points, out var opening))
                 {
                     attached = true;
                     float2 across = math.normalizesafe((opening.m_Right.d - opening.m_Left.d).xz);
@@ -109,10 +112,76 @@ namespace RoadGrass
             for (int i = 0; i < points.Count; i++)
             {
                 float3 a = points[i], b = points[(i + 1) % points.Count];
-                kinds[i] = (math.distance(a, opening.m_Left.d) < .01f && math.distance(b, opening.m_Right.d) < .01f) ||
-                    (math.distance(b, opening.m_Left.d) < .01f && math.distance(a, opening.m_Right.d) < .01f);
+                kinds[i] = IsOpeningEdge(a, b, opening);
             }
             return kinds;
+        }
+
+        private static bool IsOpeningEdge(float3 a, float3 b, Segment opening) =>
+            (math.distance(a.xz, opening.m_Left.d.xz) <= .25f && math.distance(b.xz, opening.m_Right.d.xz) <= .25f) ||
+            (math.distance(b.xz, opening.m_Left.d.xz) <= .25f && math.distance(a.xz, opening.m_Right.d.xz) <= .25f) ||
+            (OnSegment(opening.m_Left.d.xz, a.xz, b.xz) && OnSegment(opening.m_Right.d.xz, a.xz, b.xz));
+
+        private static bool OnSegment(float2 point, float2 a, float2 b)
+        {
+            float2 delta = b - a;
+            float t = math.dot(point - a, delta) / math.max(.000001f, math.lengthsq(delta));
+            return t >= -.01f && t <= 1.01f && math.distance(point, a + t * delta) <= .25f;
+        }
+
+        private readonly Dictionary<RoadGrassResolvedMedianAnchor, RoadGrassPolygonPrototypeMesh.Profile> m_PolygonProfiles = new();
+
+        private RoadGrassPolygonPrototypeMesh.Profile PolygonProfile(RoadGrassResolvedMedianAnchor source)
+        {
+            if (!m_PolygonProfiles.TryGetValue(source, out var profile))
+            {
+                profile = RoadGrassPolygonPrototypeMesh.ReadProfile(EntityManager,
+                    World.GetExistingSystemManaged<PrefabSystem>(), source);
+                m_PolygonProfiles[source] = profile;
+                Mod.TryInfo($"[PolygonProfile] width={source.Width} inset={profile.Insets} curb={profile.CurbWidth} height={profile.Height} base={profile.BaseHeight} bevel={profile.TopInset} section={profile.Section?.Count ?? 0} uv={profile.CurbU}/{profile.TextureScale}");
+            }
+            return profile;
+        }
+
+        private List<RoadGrassPolygonShape.Loop> BuildPolygonLoops(RoadGrassResolvedMedianAnchor source,
+            IReadOnlyList<float3> points, bool[] openings, float4 shape, bool extend)
+        {
+            bool attached = false;
+            foreach (bool opening in openings) attached |= opening;
+            var input = new List<float3>(points);
+            shape.x += math.csum(PolygonProfile(source).Insets) * .5f;
+            if (extend)
+            {
+                if (attached && RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, source, out var approach))
+                {
+                    shape.y = 0; // Attachment has no transverse padding or end cap.
+                    for (int i = 0; i < openings.Length; i++)
+                    {
+                        if (!openings[i]) continue;
+                        int next = (i + 1) % input.Count;
+                        bool leftFirst = math.distance(input[i].xz, approach.m_Left.d.xz) < math.distance(input[next].xz, approach.m_Left.d.xz);
+                        input[i] = leftFirst ? approach.m_Left.d : approach.m_Right.d;
+                        input[next] = leftFirst ? approach.m_Right.d : approach.m_Left.d;
+                    }
+                }
+            }
+            var loops = RoadGrassPolygonShape.Build(input, openings, shape);
+            if (extend && attached && RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, source, out var seam))
+            {
+                var inset = PolygonProfile(source).Insets;
+                float3 across = math.normalizesafe(seam.m_Right.d - seam.m_Left.d);
+                float3 left = seam.m_Left.d + across * inset.x, right = seam.m_Right.d - across * inset.y;
+                foreach (var loop in loops)
+                for (int i = 0; i < loop.Points.Count; i++)
+                {
+                    if (!loop.Opening[i]) continue;
+                    int next = (i + 1) % loop.Points.Count;
+                    bool leftFirst = math.distance(loop.Points[i].xz, left.xz) < math.distance(loop.Points[next].xz, left.xz);
+                    loop.Points[i] = leftFirst ? left : right;
+                    loop.Points[next] = leftFirst ? right : left;
+                }
+            }
+            return loops;
         }
 
         private bool BindPolygonSurface(RoadGrassResolvedMedianAnchor anchor, List<RoadGrassPolygonSections.Section> sections,
@@ -140,8 +209,7 @@ namespace RoadGrass
             for (int i = 0; i < points.Count; i++)
             {
                 var a = points[i]; var b = points[(i + 1) % points.Count];
-                if ((math.distance(a, opening.m_Left.d) < .01f && math.distance(b, opening.m_Right.d) < .01f) ||
-                    (math.distance(b, opening.m_Left.d) < .01f && math.distance(a, opening.m_Right.d) < .01f)) return true;
+                if (IsOpeningEdge(a, b, opening)) return true;
             }
             return false;
         }
@@ -169,6 +237,8 @@ namespace RoadGrass
         {
             plan = null;
             if (!TryResolvePolygon(median, out var source, out _) || !median.Attached || median.Sections == null || median.Sections.Count == 0) return false;
+            if (RoadGrassPolygonPrototypeBatchSystem.Instance?.IsReady(median.Saved.Id) == true)
+                return TryPlanEndpoint(source, MedianSavedCap.None, out plan, true);
             bool any = false;
             for (int i = 0; i < 256; i++)
             {
@@ -180,13 +250,13 @@ namespace RoadGrass
             return any && TryPlanEndpoint(source, MedianSavedCap.None, out plan, true);
         }
 
-        internal bool PlacePolygon(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points, MedianSavedSurface surface, IReadOnlyList<bool> snapped = null)
+        internal bool PlacePolygon(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points, MedianSavedSurface surface, IReadOnlyList<bool> snapped = null, bool extendFromMedian = true)
         {
-            if (!TryPolygonPreview(anchor, points, surface, out _)) return false;
+            if (!TryPolygonPreview(anchor, points, surface, out _, extendFromMedian)) return false;
             int id = 1;
             foreach (int existing in m_ManualMedians.Keys) id = math.max(id, existing + 1);
             if (id >= int.MaxValue / 256) { ManualMessage = "Too many saved medians"; return false; }
-            var saved = new RoadGrassSavedManualMedian { Id = id, Node = anchor.Node, Edge = anchor.Key.Edge, Anchor = anchor.Data, Surface = surface };
+            var saved = new RoadGrassSavedManualMedian { Id = id, Node = anchor.Node, Edge = anchor.Key.Edge, Anchor = anchor.Data, Surface = surface, ExtendFromMedian = extendFromMedian };
             var median = new ManualMedian { Saved = saved };
             float3 origin = EntityManager.GetComponentData<Node>(anchor.Node).m_Position;
             for (int i = 0; i < points.Count; i++)
@@ -250,10 +320,20 @@ namespace RoadGrass
             // Shape edits can reduce the section count to zero; old plans must not remain pickable.
             for (int i = 0; i < 256; i++)
                 m_TaperPlans.Remove(new RoadGrassMedianAnchorKey(median.Saved.Edge, median.Saved.Anchor.End, -(id * 256 + i)));
-            if (!EnsurePolygonPlan(median, out var source)) return;
+            if (!EnsurePolygonPlan(median, out var source))
+            {
+                RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
+                return;
+            }
             if (median.Halves == null && !BindPolygonSurface(source, median.Sections, median.Saved.Surface, out median.Halves, out var error))
-            { if (id == SelectedManualMedianId) ManualMessage = error; return; }
+            {
+                if (id == SelectedManualMedianId) ManualMessage = error;
+                RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
+                return;
+            }
             var halves = median.Halves;
+            bool prototype = TryQueuePolygonPrototype(id, median, source, out var prototypeError);
+            if (id == SelectedManualMedianId && prototypeError != null) ManualMessage = prototypeError;
             for (int i = 0; i < halves.Count; i++)
             {
                 var half = halves[i];
@@ -271,10 +351,82 @@ namespace RoadGrass
                     CompositionPiecesEqual(existing.Transition.Pieces, half.Pieces)) half = existing.Transition;
                 m_PolygonRenderKeys.Add(key);
                 m_TaperPlans[key] = new TaperPlan { Source = half.Source, Half = half, Manual = true };
+                // Native halves remain the existing pick/preview shape, not a second visible median.
+                if (prototype) continue;
                 m_RenderPairs[key] = key; m_Resolved[key] = half.Source;
                 BatchDataHelpers.CalculateNodeParameters(half.Geometry, half.Composition, out var parameters);
                 m_RenderStates[key] = new MedianRenderState(key, parameters, half.Geometry.m_Bounds);
             }
+        }
+
+        private bool TryQueuePolygonPrototype(int id, ManualMedian median, RoadGrassResolvedMedianAnchor source, out string reason)
+        {
+            reason = null;
+            var renderer = RoadGrassPolygonPrototypeBatchSystem.Instance;
+            if (renderer == null) return false;
+            if (median.Sections.Count == 0) { renderer.Remove(id); return true; }
+            if (!renderer.TryInitialize(out var error)) { reason = "Polygon mesh prototype unavailable: " + error; return false; }
+            if (renderer.Matches(id, median.Sections, median.Saved.Surface, out bool accepted, out reason)) return accepted;
+            if (!TryResolvePolygon(median, out source, out var points)) { renderer.Remove(id); return false; }
+            try
+            {
+                var loops = BuildPolygonLoops(source, points,
+                    median.Saved.ExtendFromMedian ? PolygonOpeningEdges(source, points) : new bool[points.Count],
+                    median.Saved.Shape, median.Saved.ExtendFromMedian);
+                var origin = EntityManager.GetComponentData<Node>(source.Node).m_Position;
+                var profile = PolygonProfile(source);
+                if (median.Saved.CurbWidth > 0)
+                {
+                    float scale = median.Saved.CurbWidth / profile.CurbWidth;
+                    profile.CurbWidth = median.Saved.CurbWidth;
+                    profile.TopInset *= scale;
+                    if (profile.Section != null)
+                    {
+                        profile.Section = new List<RoadGrassPolygonPrototypeMesh.CurbVertex>(profile.Section);
+                        for (int i = 0; i < profile.Section.Count; i++)
+                        {
+                            var vertex = profile.Section[i]; vertex.Depth *= scale; profile.Section[i] = vertex;
+                        }
+                    }
+                }
+                bool grass = median.Saved.Surface == MedianSavedSurface.Grass ||
+                    (median.Saved.Surface == MedianSavedSurface.None &&
+                    (source.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
+                var projection = GetPolygonHeightProjection(source);
+                float3 ProjectFoot(float3 p) => (projection == null ? p : projection(p)) + new float3(0, profile.BaseHeight, 0);
+                var mesh = RoadGrassPolygonPrototypeMesh.Build(loops, origin, profile, ProjectFoot, grass);
+                if (mesh == null) { renderer.Remove(id); return true; }
+                var outline = new List<Line3.Segment>();
+                foreach (var loop in loops)
+                for (int i = 0; i < loop.Points.Count; i++)
+                {
+                    float3 a = loop.Points[i], b = loop.Points[(i + 1) % loop.Points.Count];
+                    int samples = math.clamp((int)math.ceil(math.distance(a.xz, b.xz)), 1, 128);
+                    float3 At(int sample)
+                    {
+                        var point = math.lerp(a, b, sample / (float)samples);
+                        return ProjectFoot(point) + new float3(0, profile.Height + .03f, 0);
+                    }
+                    for (int sample = 0; sample < samples; sample++) outline.Add(new Line3.Segment(At(sample), At(sample + 1)));
+                }
+                RoadGrassPolygonPrototypeResources.CopyMedianMaterials(EntityManager,
+                    World.GetExistingSystemManaged<PrefabSystem>(), source, out var pavementMaterial, out var grassMaterial, out var materialTextures);
+                renderer.Submit(id, median.Sections, median.Saved.Surface, mesh, origin, grass, outline,
+                    pavementMaterial, grassMaterial, materialTextures);
+                return true;
+            }
+            catch (System.Exception exception)
+            {
+                renderer.Remove(id);
+                reason = "Polygon mesh prototype: " + exception.Message;
+                return false;
+            }
+        }
+
+        internal void PolygonPrototypeChanged(int id, string error)
+        {
+            m_Dirty = true;
+            if (id == SelectedManualMedianId && error != null) ManualMessage = error;
         }
     }
 
@@ -296,7 +448,7 @@ namespace RoadGrass
             return hit < float.MaxValue;
         }
 
-        private static bool RayTriangle(Line3.Segment ray, float3 a, float3 b, float3 c, out float t)
+        internal static bool RayTriangle(Line3.Segment ray, float3 a, float3 b, float3 c, out float t)
         {
             t = 0;
             float3 direction = ray.b - ray.a, e = b - a, f = c - a;
@@ -329,11 +481,12 @@ namespace RoadGrass
 
         // Split at vertex heights: each native section has two straight polygon boundary
         // edges and open cross-sections. Concave polygons can have multiple spans per slice.
-        internal static bool TryBuild(IReadOnlyList<float3> points, out List<Section> sections, out string reason, float2? attachmentForward = null)
+        internal static bool TryBuild(IReadOnlyList<float3> points, out List<Section> sections, out string reason, float2? attachmentForward = null,
+            int maxPoints = 128, int maxSections = 256)
         {
             sections = new List<Section>(); reason = "Polygon needs at least three corners (128 outline samples maximum)";
             int count = points.Count;
-            if (count < 3 || count > 128) return false;
+            if (count < 3 || count > maxPoints) return false;
             reason = "Polygon contains a non-finite position";
             for (int i = 0; i < count; i++)
             {
@@ -392,7 +545,7 @@ namespace RoadGrass
                     if (math.distance(la, ra) < math.distance(ld, rd))
                     { var a = la; var b = ra; la = rd; ra = ld; ld = b; rd = a; }
                     sections.Add(new Section { Left = Line(la, ld), Right = Line(ra, rd) });
-                    if (sections.Count >= 256) { reason = "Polygon needs too many native sections"; return false; }
+                    if (sections.Count >= maxSections) { reason = "Polygon needs too many native sections"; return false; }
                 }
             }
             reason = ""; return sections.Count > 0;

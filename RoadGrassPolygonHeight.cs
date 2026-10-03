@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Colossal.Entities;
 using Colossal.Mathematics;
@@ -13,7 +14,23 @@ namespace RoadGrass
 
         private void ConformPolygonHeight(RoadGrassTransitionMesh.Half half, RoadGrassResolvedMedianAnchor source)
         {
-            if (!RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, source, out var opening)) return;
+            var point = GetPolygonHeightProjection(source);
+            if (point == null) return;
+            var node = half.Geometry;
+            node.m_Left.m_Left = Project(node.m_Left.m_Left); node.m_Left.m_Right = Project(node.m_Left.m_Right);
+            node.m_Right.m_Left = Project(node.m_Right.m_Left); node.m_Right.m_Right = Project(node.m_Right.m_Right);
+            node.m_Middle = Project(node.m_Middle);
+            node.m_Left.m_Length = new float2(MathUtils.Length(node.m_Left.m_Left), MathUtils.Length(node.m_Left.m_Right));
+            node.m_Right.m_Length = new float2(MathUtils.Length(node.m_Right.m_Left), MathUtils.Length(node.m_Right.m_Right));
+            node.m_Bounds = MathUtils.TightBounds(node.m_Left.m_Left) | MathUtils.TightBounds(node.m_Right.m_Right) | MathUtils.TightBounds(node.m_Middle);
+            half.Geometry = node;
+
+            Bezier4x3 Project(Bezier4x3 curve) => new Bezier4x3(point(curve.a), point(curve.b), point(curve.c), point(curve.d));
+        }
+
+        private Func<float3, float3> GetPolygonHeightProjection(RoadGrassResolvedMedianAnchor source)
+        {
+            if (!RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, source, out var opening)) return null;
             if (!m_PolygonRoadSurfaces.TryGetValue(source.Node, out var triangles))
             {
                 triangles = new List<RoadGrassPolygonSurface.Triangle>();
@@ -28,20 +45,11 @@ namespace RoadGrass
                         if (data.m_End == source.Node && EntityManager.TryGetComponent(edge, out EndNodeGeometry end)) Add(end.m_Geometry);
                     }
             }
-            if (triangles.Count == 0) return;
+            if (triangles.Count == 0) return null;
             float3 l = opening.m_Left.d, r = opening.m_Right.d;
             float leftOffset = l.y - RoadGrassPolygonSurface.Height(l, triangles);
             float rightOffset = r.y - RoadGrassPolygonSurface.Height(r, triangles);
-            var node = half.Geometry;
-            node.m_Left.m_Left = Project(node.m_Left.m_Left); node.m_Left.m_Right = Project(node.m_Left.m_Right);
-            node.m_Right.m_Left = Project(node.m_Right.m_Left); node.m_Right.m_Right = Project(node.m_Right.m_Right);
-            node.m_Middle = Project(node.m_Middle);
-            node.m_Left.m_Length = new float2(MathUtils.Length(node.m_Left.m_Left), MathUtils.Length(node.m_Left.m_Right));
-            node.m_Right.m_Length = new float2(MathUtils.Length(node.m_Right.m_Left), MathUtils.Length(node.m_Right.m_Right));
-            node.m_Bounds = MathUtils.TightBounds(node.m_Left.m_Left) | MathUtils.TightBounds(node.m_Right.m_Right) | MathUtils.TightBounds(node.m_Middle);
-            half.Geometry = node;
-
-            Bezier4x3 Project(Bezier4x3 curve) => new Bezier4x3(Point(curve.a), Point(curve.b), Point(curve.c), Point(curve.d));
+            return Point;
             float3 Point(float3 p)
             {
                 float2 across = r.xz - l.xz;

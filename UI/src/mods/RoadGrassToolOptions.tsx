@@ -20,6 +20,7 @@ const filters$ = bindValue<number>(mod.id, "ResetFilters");
 const active$ = bindValue<boolean>(mod.id, "IsActive");
 const selectedManual$ = bindValue<number>(mod.id, "SelectedManualMedianId");
 const snapping$ = bindValue<boolean>(mod.id, "PolygonSnapping");
+const polygonExtend$ = bindValue<boolean>(mod.id, "PolygonExtendFromMedian");
 const tooltipStyle = getModule(
   "game-ui/common/tooltip/description-tooltip/description-tooltip.module.scss", "classes"
 );
@@ -39,6 +40,7 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
   const mode = useValue(mode$);
   const selectedManual = useValue(selectedManual$);
   const snapping = useValue(snapping$);
+  const polygonExtend = useValue(polygonExtend$);
   const cap = useValue(cap$);
   const surface = useValue(surface$);
   const filters = useValue(filters$);
@@ -77,9 +79,11 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
   );
     if (mode === 3) {
         rows.push(
+            <Section key="polygonExtend" title={title("PolygonExtendFromMedian", "Extend from median")}>
+                {button("PolygonExtendFromMedian", "Extend from median", "Open the joining curb and remove the original median end cap where the polygon joins its two end corners. Turn off to keep the polygon closed.", connectIcon, polygonExtend, "SetPolygonExtendFromMedian", !polygonExtend)}
+            </Section>,
             <Section key="polygonSnapping" title={title("Snapping", "Snapping")}>
                 {button("PolygonSnapping", "Snapping", "Toggle lane, marking and median-corner snapping. Closing the polygon stays available when snapping is off.", polygonIcon, snapping, "SetPolygonSnapping", !snapping)}
-                <span>{snapping ? title("On", "On") : title("Off", "Off")}</span>
             </Section>
         );
     }
