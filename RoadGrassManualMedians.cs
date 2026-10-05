@@ -77,7 +77,7 @@ namespace RoadGrass
             ResetManualRuntime(); m_Dirty = true;
         }
         internal void SelectManualMedian(int id)
-        { SelectedManualMedianId = m_ManualMedians.ContainsKey(id) ? id : 0; ManualMessage = ""; }
+        { SelectedManualMedianId = m_ManualMedians.TryGetValue(id, out var median) ? id : 0; ManualMessage = median?.ShapeMessage ?? ""; }
 
         internal bool CanStartManualMedian(RoadGrassResolvedMedianAnchor anchor) => anchor != null && m_GameReady &&
             !m_SuspendedForSave && !m_WaitingForLoadSettle && !m_ActivePairs.ContainsKey(anchor.Key) &&
@@ -177,7 +177,7 @@ namespace RoadGrass
 
             bool ReadLanes(Entity owner, bool isNode)
             {
-                m_TaperDependencies.Add(owner);
+                TrackTaperDependency(owner);
                 if (!EntityManager.HasBuffer<Game.Net.SubLane>(owner)) return false;
                 foreach(var sub in EntityManager.GetBuffer<Game.Net.SubLane>(owner,true))
                 {
@@ -185,7 +185,7 @@ namespace RoadGrass
                     if(!seen.Add(lane)||EntityManager.HasComponent<Deleted>(lane)||EntityManager.HasComponent<Game.Tools.Temp>(lane))continue;
                     bool car=EntityManager.HasComponent<Game.Net.CarLane>(lane);
                     if(!car&&!EntityManager.HasComponent<Game.Net.PedestrianLane>(lane)&&!EntityManager.HasComponent<Game.Net.TrackLane>(lane))continue;
-                    m_TaperDependencies.Add(lane);
+                    TrackTaperDependency(lane);
                     if(!EntityManager.TryGetComponent(lane,out Game.Net.Curve curve)||!EntityManager.TryGetComponent(lane,out PrefabRef prefab)||
                        !EntityManager.TryGetComponent(prefab.m_Prefab,out NetLaneData data))return false;
                     var item=new RoadGrassTaperGeometry.Lane{Curve=curve.m_Bezier,Width=data.m_Width};
@@ -211,7 +211,7 @@ namespace RoadGrass
             var vertices=EntityManager.GetBuffer<RoadGrassSavedManualMedianVertex>(city);
             foreach(var p in median.Points)vertices.Add(new RoadGrassSavedManualMedianVertex{Id=id,Offset=p});
             m_ManualMedians.Add(id,median);m_ManualKeys.Add(saved.Key,id);
-            SelectedManualMedianId=id;ManualMessage="";ClearTaperPlans();m_Dirty=true;return true;
+            SelectedManualMedianId=id;ManualMessage="";ClearTaperPlans(false);m_Dirty=true;return true;
         }
 
         internal bool SetManualSurface(int id, MedianSavedSurface surface)
@@ -231,7 +231,7 @@ namespace RoadGrass
             var saved=median.Saved;saved.Surface=surface;median.Saved=saved;
             var records=EntityManager.GetBuffer<RoadGrassSavedManualMedian>(m_CityQuery.GetSingletonEntity());
             for(int i=0;i<records.Length;i++)if(records[i].Id==id)records[i]=saved;
-            if (median.Points.Count < 3) ClearTaperPlans();
+            if (median.Points.Count < 3) ClearTaperPlans(false);
             m_Dirty=true;ManualMessage=median.ShapeMessage;return true;
         }
         internal void RemoveManualMedian(int id)
@@ -246,7 +246,7 @@ namespace RoadGrass
             RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
             if (median.Points.Count == 2) m_ManualKeys.Remove(median.Saved.Key);
             if(SelectedManualMedianId==id)SelectedManualMedianId=0;
-            ClearTaperPlans();m_Dirty=true;ManualMessage="";
+            ClearTaperPlans(false);m_Dirty=true;ManualMessage="";
         }
         private bool TryResolveManual(ManualMedian median,out RoadGrassResolvedMedianAnchor anchor,out float3 destination)
         {
@@ -278,8 +278,8 @@ namespace RoadGrass
             foreach(var entry in m_ManualMedians)
             {
                 var median=entry.Value;
-                m_TaperDependencies.Add(median.Saved.Edge);
-                m_TaperDependencies.Add(median.Saved.Node);
+                TrackTaperDependency(median.Saved.Edge);
+                TrackTaperDependency(median.Saved.Node);
                 if (median.Points.Count >= 3) { SynchronizePolygon(entry.Key, median); continue; }
                 if(!TryResolveManual(median,out var anchor,out var destination))
                 {ManualMessage="Saved contour unavailable: its source cannot be rebound safely";continue;}

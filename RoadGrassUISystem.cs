@@ -128,9 +128,8 @@ namespace RoadGrass
 
         private void OnToolChanged(ToolBaseSystem tool)
         {
-            if (tool != m_JoinToolSystem && !m_MedianActivationPending &&
-                m_NetToolSystem.prefab?.name == RoadGrassPrefabSystem.PrefabName)
-                m_NetToolSystem.prefab = null;
+            // Keep NetToolSystem's prefab valid for mods that inspect it on tool changes.
+            // Only a fresh prefab selection arms Median Controller activation.
             if (tool != m_NetToolSystem) m_MedianActivationPending = false;
             SynchronizeTool();
         }

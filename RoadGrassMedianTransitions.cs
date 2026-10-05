@@ -36,19 +36,21 @@ namespace RoadGrass
             foreach (var key in remove) m_TransitionPlans.Remove(key);
         }
 
+        private void PruneTransitionPlans()
+        {
+            if (m_TransitionPlans.Count <= 32) return;
+            var remove = new List<(RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey)>();
+            foreach (var entry in m_TransitionPlans.Keys)
+                if (!m_ActivePairs.TryGetValue(entry.Item1, out var paired) || !paired.Equals(entry.Item2)) remove.Add(entry);
+            foreach (var entry in remove) m_TransitionPlans.Remove(entry);
+        }
+
         private bool TryPlanTransition(RoadGrassResolvedMedianAnchor a, RoadGrassResolvedMedianAnchor b,
             EdgeGeometry ga, EdgeGeometry gb, out TransitionPair plan)
         {
             a = GetStyledContinuation(a);
             b = GetStyledContinuation(b);
             var key = (a.Key, b.Key);
-            if (m_TransitionPlans.Count > 32)
-            {
-                var remove = new List<(RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey)>();
-                foreach (var entry in m_TransitionPlans.Keys)
-                    if (!m_ActivePairs.TryGetValue(entry.Item1, out var paired) || !paired.Equals(entry.Item2)) remove.Add(entry);
-                foreach (var entry in remove) m_TransitionPlans.Remove(entry);
-            }
             Entity na = GetOriginalEndpoint(a.Key), nb = GetOriginalEndpoint(b.Key);
             if (m_TransitionPlans.TryGetValue(key, out plan) && plan.NodeA == na && plan.NodeB == nb &&
                 plan.SourceA.SourceComposition == a.SourceComposition && plan.SourceB.SourceComposition == b.SourceComposition &&

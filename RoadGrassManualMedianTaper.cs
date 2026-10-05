@@ -42,13 +42,13 @@ namespace RoadGrass
 
             void Read(Entity owner)
             {
-                m_TaperDependencies.Add(owner);
+                TrackTaperDependency(owner);
                 if (!EntityManager.HasBuffer<Game.Net.SubLane>(owner)) return;
                 foreach (var sub in EntityManager.GetBuffer<Game.Net.SubLane>(owner, true))
                 {
                     Entity lane = sub.m_SubLane;
                     if (!seen.Add(lane) || EntityManager.HasComponent<Deleted>(lane) || EntityManager.HasComponent<Game.Tools.Temp>(lane)) continue;
-                    m_TaperDependencies.Add(lane);
+                    TrackTaperDependency(lane);
                     if (!EntityManager.TryGetComponent(lane, out Game.Net.Curve curve) ||
                         !EntityManager.TryGetComponent(lane, out PrefabRef prefab) ||
                         !prefabs.TryGetPrefab<NetLaneGeometryPrefab>(prefab, out var geometry) || geometry == null || geometry.m_Meshes == null) continue;
@@ -144,8 +144,8 @@ namespace RoadGrass
             TryCreateManualTaper(anchor,destination,out half,out _);
             m_TaperPlans[anchor.Key]=new TaperPlan { Source=anchor,NodeComposition=source,Edge=edge,
                 Manual=true,Destination=destination,Half=half };
-            m_TaperDependencies.Add(anchor.Key.Edge);
-            m_TaperDependencies.Add(anchor.Node);
+            TrackTaperDependency(anchor.Key.Edge);
+            TrackTaperDependency(anchor.Node);
             return half!=null;
         }
 
@@ -157,7 +157,7 @@ namespace RoadGrass
             if (m_TaperSnapPoints.TryGetValue(node,out var points)) { AdvanceSnapPoints(node); return points; }
             points = new List<float3>();
             m_TaperSnapPoints[node]=points;
-            m_TaperDependencies.Add(node);
+            TrackTaperDependency(node);
             if (!EntityManager.HasBuffer<Game.Net.SubLane>(node)) return points;
             var lines = new List<Line3.Segment>();
             var guides = new List<int>();
@@ -165,7 +165,7 @@ namespace RoadGrass
             foreach (var entry in EntityManager.GetBuffer<Game.Net.SubLane>(node,true))
             {
                 Entity lane=entry.m_SubLane;
-                m_TaperDependencies.Add(lane);
+                TrackTaperDependency(lane);
                 if (EntityManager.HasComponent<Deleted>(lane) || !EntityManager.HasComponent<Game.Net.CarLane>(lane) ||
                     !EntityManager.TryGetComponent(lane,out Game.Net.Curve curve) ||
                     !EntityManager.TryGetComponent(lane,out PrefabRef prefab) ||

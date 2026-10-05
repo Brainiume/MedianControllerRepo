@@ -57,12 +57,13 @@ namespace RoadGrass
             m_SurfaceContinuations = new();
         private readonly Dictionary<RoadGrassMedianAnchorKey, RoadGrassSavedEndpointStyle> m_Styles = new();
         private readonly HashSet<Entity> m_StyledEdges = new();
+        private readonly Dictionary<Entity, EdgeRuntimeStamp> m_StyledEdgeStamps = new();
         private readonly List<Entity> m_PendingEndpointMeshes = new();
         private bool m_StylesLoaded;
 
         internal void ClearStylePreviewCache()
         {
-            ClearTaperPlans();
+            ClearTaperPlans(false);
             m_SegmentAnchors.Clear();
             m_SegmentPlans.Clear();
             m_StylePlans.Clear();
@@ -294,6 +295,8 @@ namespace RoadGrass
         private void TrackStyledEdge(Entity edge)
         {
             m_StyledEdges.Add(edge);
+            if (!m_StyledEdgeStamps.ContainsKey(edge) && TryCaptureTaperStamp(edge, out var stamp))
+                m_StyledEdgeStamps[edge] = stamp;
             if (EntityManager.Exists(edge) && !EntityManager.HasComponent<RoadGrassStyledEdge>(edge))
                 EntityManager.AddComponent<RoadGrassStyledEdge>(edge);
         }
@@ -377,6 +380,7 @@ namespace RoadGrass
             foreach (var key in obsolete) RestoreEndpointMesh(key);
             foreach (var entry in desired)
             {
+                TrackStyledEdge(entry.Key.Edge);
                 Entity source = entry.Value[0].Source;
                 var sourcePieces = EntityManager.GetBuffer<NetCompositionPiece>(source, true);
                 var pieces = new List<NetCompositionPiece>();
@@ -390,7 +394,18 @@ namespace RoadGrass
                     else if (emitted.Add(piece.m_SectionIndex)) pieces.AddRange(plan.Pieces);
                 }
                 if (m_EndpointMeshes.TryGetValue(entry.Key, out var current) && current.Source == source &&
-                    CompositionPiecesEqual(current.Pieces, pieces)) continue;
+                    EntityManager.Exists(current.Variant) && CompositionPiecesEqual(current.Pieces, pieces))
+                {
+                    var existing = EntityManager.GetComponentData<Composition>(entry.Key.Edge);
+                    if ((entry.Key.End ? existing.m_EndNode : existing.m_StartNode) != current.Variant)
+                    {
+                        if (entry.Key.End) existing.m_EndNode = current.Variant;
+                        else existing.m_StartNode = current.Variant;
+                        EntityManager.SetComponentData(entry.Key.Edge, existing);
+                        MarkEndpointBatches(entry.Key.Edge);
+                    }
+                    continue;
+                }
                 RestoreEndpointMesh(entry.Key);
                 Entity variant = EntityManager.Instantiate(source);
                 var buffer = EntityManager.GetBuffer<NetCompositionPiece>(variant);
@@ -408,12 +423,14 @@ namespace RoadGrass
             var retained = new HashSet<Entity>();
             foreach (var style in m_Styles.Values) retained.Add(style.Edge);
             foreach (var surface in m_SegmentSurfaces.Values) retained.Add(surface.Edge);
+            foreach (var endpoint in m_EndpointMeshes.Keys) retained.Add(endpoint.Edge);
             foreach (var edge in new List<Entity>(m_StyledEdges))
             {
                 if (retained.Contains(edge)) continue;
                 if (EntityManager.Exists(edge) && EntityManager.HasComponent<RoadGrassStyledEdge>(edge))
                     EntityManager.RemoveComponent<RoadGrassStyledEdge>(edge);
                 m_StyledEdges.Remove(edge);
+                m_StyledEdgeStamps.Remove(edge);
             }
         }
 
@@ -461,6 +478,7 @@ namespace RoadGrass
                 if (EntityManager.Exists(edge) && EntityManager.HasComponent<RoadGrassStyledEdge>(edge))
                     EntityManager.RemoveComponent<RoadGrassStyledEdge>(edge);
             m_StyledEdges.Clear();
+            m_StyledEdgeStamps.Clear();
             m_Styles.Clear();
         }
 
@@ -502,6 +520,24 @@ namespace RoadGrass
 
         internal void InvalidateEndpointStyles(Entity edge)
         {
+            bool deleted = !EntityManager.Exists(edge) || EntityManager.HasComponent<Deleted>(edge);
+            if (!deleted)
+            {
+                if (!TryCaptureTaperStamp(edge, out var current)) return;
+                if (m_StyledEdgeStamps.TryGetValue(edge, out var saved) && saved.Equals(current))
+                {
+                    // Native composition replacement may need the cap/surface
+                    // reapplied, but must not invalidate any polygon geometry.
+                    if (EntityManager.TryGetComponent(edge, out Composition composition) &&
+                        ((m_SegmentMeshes.TryGetValue(edge, out var segment) && composition.m_Edge != segment.Variant) ||
+                         (m_EndpointMeshes.TryGetValue(new EndpointCacheKey(edge, false), out var start) && composition.m_StartNode != start.Variant) ||
+                         (m_EndpointMeshes.TryGetValue(new EndpointCacheKey(edge, true), out var end) && composition.m_EndNode != end.Variant)))
+                        m_Dirty = true;
+                    return;
+                }
+                m_StyledEdgeStamps[edge] = current;
+            }
+            else m_StyledEdgeStamps.Remove(edge);
             ClearTaperPlans();
             InvalidateTransitions(edge);
             m_SegmentAnchors.Remove(edge);
@@ -509,7 +545,6 @@ namespace RoadGrass
             m_StylePlans.Clear();
             m_SurfaceContinuations.Clear();
             m_ResolveCache.Clear();
-            bool deleted = !EntityManager.Exists(edge) || EntityManager.HasComponent<Deleted>(edge);
             if (deleted) RemoveSegmentRecords(edge);
             if (TryGetEndpointStyles(false, out var styles))
             {

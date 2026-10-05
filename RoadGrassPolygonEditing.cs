@@ -39,8 +39,18 @@ namespace RoadGrass
         {
             if (!TryResolveSavedAnchor(median.Saved.Edge, median.Saved.Anchor, out source)) return false;
             if (median.Sections != null && median.PlanEpoch == m_PolygonPlanEpoch) return true;
-            if (!TryResolvePolygon(median, out source, out var points) ||
-                !TryPlanPolygon(source, points, median.Saved.Shape, out var sections, out var attached, out var reason, median.Saved.ExtendFromMedian)) return false;
+            if (!TryResolvePolygon(median, out source, out var points))
+            {
+                median.ShapeMessage = "Polygon outline could not be resolved";
+                if (median.Saved.Id == SelectedManualMedianId) ManualMessage = median.ShapeMessage;
+                return false;
+            }
+            if (!TryPlanPolygon(source, points, median.Saved.Shape, out var sections, out var attached, out var reason, median.Saved.ExtendFromMedian))
+            {
+                median.ShapeMessage = reason;
+                if (median.Saved.Id == SelectedManualMedianId) ManualMessage = reason;
+                return false;
+            }
             median.Sections = sections; median.Attached = attached; median.ShapeMessage = reason;
             median.HasOpening = false;
             foreach (bool opening in PolygonOpeningEdges(source, points)) median.HasOpening |= opening;

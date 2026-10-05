@@ -12,6 +12,22 @@ namespace RoadGrass
             internal readonly List<bool> Opening = new();
         }
 
+        internal static void PinOpening(Loop loop, float3 left, float3 right, float width, float2 inset)
+        {
+            // A skewed junction stretches the cross-section; authored offsets remain
+            // fractions of its native width, not world distances along the seam.
+            float3 across = (right - left) / math.max(.001f, width);
+            float3 a = left + across * inset.x, b = right - across * inset.y;
+            for (int i = 0; i < loop.Points.Count; i++)
+            {
+                if (!loop.Opening[i]) continue;
+                int next = (i + 1) % loop.Points.Count;
+                bool leftFirst = math.distancesq(loop.Points[i].xz, a.xz) < math.distancesq(loop.Points[next].xz, a.xz);
+                loop.Points[i] = leftFirst ? a : b;
+                loop.Points[next] = leftFirst ? b : a;
+            }
+        }
+
         internal static List<Loop> Build(IReadOnlyList<float3> points, IReadOnlyList<bool> opening, float4 settings)
         {
             var seed = new Loop();
@@ -23,6 +39,7 @@ namespace RoadGrass
             {
                 if (math.abs(Area(simple.Points)) < .0001f) continue;
                 var moved = Offset(simple, settings.x, settings.y);
+                var insetEdges = new List<float3>(moved.Points);
                 foreach (var part in Split(moved))
                 {
                     if (Area(part.Points) * Area(simple.Points) <= .0001f) continue;
@@ -32,15 +49,22 @@ namespace RoadGrass
                     {
                         var middle = (part.Points[i].xz + part.Points[(i + 1) % part.Points.Count].xz) * .5f;
                         if (!Inside(middle, simple.Points)) collapsed = true;
-                        float best = float.MaxValue, required = 0;
+                        float best = float.MaxValue;
+                        int sourceEdge = -1;
                         for (int j = 0; j < simple.Points.Count; j++)
                         {
-                            float2 a = simple.Points[j].xz, d = simple.Points[(j + 1) % simple.Points.Count].xz - a;
+                            float2 a = insetEdges[j].xz, d = insetEdges[(j + 1) % insetEdges.Count].xz - a;
                             float t = math.saturate(math.dot(middle - a, d) / math.max(1e-8f, math.lengthsq(d)));
                             float distance = math.distance(middle, a + d * t);
-                            if (distance < best) { best = distance; required = simple.Opening[j] ? settings.y : settings.x; }
+                            if (distance < best) { best = distance; sourceEdge = j; }
                         }
-                        if (best + .002f < required) collapsed = true;
+                        // An open attachment can legitimately blend unequal edge offsets.
+                        // Test direction against the generating edge instead of rejecting the
+                        // entire grass island for being close to a different original edge.
+                        if (sourceEdge >= 0 && math.dot(
+                            part.Points[(i + 1) % part.Points.Count].xz - part.Points[i].xz,
+                            simple.Points[(sourceEdge + 1) % simple.Points.Count].xz - simple.Points[sourceEdge].xz) < 0)
+                            collapsed = true;
                     }
                     if (!collapsed)
                     {
@@ -172,7 +196,14 @@ namespace RoadGrass
             return inside;
         }
         private static float Area(List<float3> points)
-        { float a = 0; for (int i = 0; i < points.Count; i++) a += Cross(points[i].xz, points[(i + 1) % points.Count].xz); return a * .5f; }
+        {
+            if (points.Count < 3) return 0;
+            float a = 0;
+            float2 origin = points[0].xz;
+            for (int i = 0; i < points.Count; i++)
+                a += Cross(points[i].xz - origin, points[(i + 1) % points.Count].xz - origin);
+            return a * .5f;
+        }
         private static float Cross(float2 a, float2 b) => a.x * b.y - a.y * b.x;
     }
 }

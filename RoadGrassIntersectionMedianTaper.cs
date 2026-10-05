@@ -33,6 +33,7 @@ namespace RoadGrass
         private readonly Dictionary<RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey> m_RenderPairs = new();
         private readonly Dictionary<RoadGrassMedianAnchorKey, TaperPlan> m_TaperPlans = new();
         private readonly HashSet<Entity> m_TaperDependencies = new();
+        private readonly Dictionary<Entity, EdgeRuntimeStamp> m_TaperDependencyStamps = new();
         internal bool HasTaperPlans => m_TaperPlans.Count != 0 || m_TaperSnapPoints.Count != 0 || m_ManualMedians.Count != 0;
 
         internal bool TryBuildTaperPreview(RoadGrassResolvedMedianAnchor anchor, out EdgeGeometry geometry)
@@ -52,33 +53,108 @@ namespace RoadGrass
             return !EntityManager.TryGetComponent(GetOriginalEndpoint(key), out NetCompositionMeshRef original) || original.m_Mesh != mesh.m_Mesh;
         }
 
-        private void ClearTaperPlans()
+        private void ClearTaperPlans(bool geometryChanged = true)
         {
+            m_ManualPreviewSet = false;
+            m_PolygonPreviewPoints = null;
+            m_TaperPlans.Clear();
+            // Adding/editing a median does not change road geometry. Keep the
+            // existing polygons' sections, profiles and renderer resources.
+            if (!geometryChanged) return;
             m_PolygonPlanEpoch++;
             m_PolygonReferenceGuides.Clear();
-            m_ManualPreviewSet = false;
             m_TaperSnapPoints.Clear();
             foreach (var builder in m_TaperSnapBuilders.Values) builder.Dispose();
             m_TaperSnapBuilders.Clear();
-            m_PolygonPreviewPoints = null;
             m_PolygonGuides.Clear(); m_PolygonGuideEdges.Clear();
             m_PolygonRoadSurfaces.Clear();
             m_PolygonProfiles.Clear();
             m_MarkingGuides.Clear();
-            m_TaperPlans.Clear();
             m_TaperDependencies.Clear();
+            m_TaperDependencyStamps.Clear();
+        }
+
+        private void TrackTaperDependency(Entity entity)
+        {
+            if (!EntityManager.HasComponent<Edge>(entity) && !EntityManager.HasComponent<Node>(entity) &&
+                EntityManager.TryGetComponent(entity, out Owner owner)) entity = owner.m_Owner;
+            m_TaperDependencies.Add(entity);
+            if (!m_TaperDependencyStamps.ContainsKey(entity) && TryCaptureTaperStamp(entity, out var stamp))
+                m_TaperDependencyStamps[entity] = stamp;
+        }
+
+        private bool TryCaptureTaperStamp(Entity entity, out EdgeRuntimeStamp stamp)
+        {
+            stamp = default;
+            if (!EntityManager.Exists(entity) || EntityManager.HasComponent<Deleted>(entity)) return false;
+            uint hash = 2166136261u;
+            Entity start = Entity.Null, end = Entity.Null;
+            if (EntityManager.HasComponent<Edge>(entity))
+            {
+                if (!TryCaptureEdgeStamp(entity, out var edge)) return false;
+                start = edge.Start; end = edge.End; hash = edge.Geometry;
+                if (EntityManager.TryGetComponent(entity, out StartNodeGeometry a))
+                {
+                    AccumulateSegmentStamp(ref hash, a.m_Geometry.m_Left);
+                    AccumulateSegmentStamp(ref hash, a.m_Geometry.m_Right);
+                }
+                if (EntityManager.TryGetComponent(entity, out EndNodeGeometry b))
+                {
+                    AccumulateSegmentStamp(ref hash, b.m_Geometry.m_Left);
+                    AccumulateSegmentStamp(ref hash, b.m_Geometry.m_Right);
+                }
+            }
+            else if (EntityManager.TryGetComponent(entity, out Node node))
+            {
+                AccumulateStamp(ref hash, node.m_Position);
+                uint edges = 0;
+                if (EntityManager.HasBuffer<ConnectedEdge>(entity))
+                    foreach (var connected in EntityManager.GetBuffer<ConnectedEdge>(entity, true))
+                        edges += (uint)connected.m_Edge.GetHashCode();
+                hash = (hash ^ edges) * 16777619u;
+            }
+            else return false;
+            if (EntityManager.TryGetComponent(entity, out PrefabRef prefab))
+                hash = (hash ^ (uint)prefab.m_Prefab.GetHashCode()) * 16777619u;
+            // Ignore signal flags and lane entity IDs. Native updates can replace
+            // lanes with equivalent curves; neither requires new median meshes.
+            uint lanes = 0, count = 0;
+            if (EntityManager.HasBuffer<SubLane>(entity))
+                foreach (var item in EntityManager.GetBuffer<SubLane>(entity, true))
+                {
+                    if (EntityManager.HasComponent<Deleted>(item.m_SubLane) ||
+                        !EntityManager.TryGetComponent(item.m_SubLane, out Game.Net.Curve curve)) continue;
+                    uint lane = 2166136261u;
+                    AccumulateStamp(ref lane, curve.m_Bezier.a); AccumulateStamp(ref lane, curve.m_Bezier.b);
+                    AccumulateStamp(ref lane, curve.m_Bezier.c); AccumulateStamp(ref lane, curve.m_Bezier.d);
+                    if (EntityManager.TryGetComponent(item.m_SubLane, out PrefabRef lanePrefab) &&
+                        EntityManager.TryGetComponent(lanePrefab.m_Prefab, out NetLaneData data))
+                        AccumulateStamp(ref lane, new float2(data.m_Width, 0));
+                    lanes += lane; count++;
+                }
+            hash = ((hash ^ lanes) * 16777619u ^ count) * 16777619u;
+            stamp = new EdgeRuntimeStamp(start, end, hash);
+            return true;
         }
 
         internal void InvalidateTaperGeometry(NativeArray<Entity> changed)
         {
+            var checkedOwners = new HashSet<Entity>();
             foreach (var entity in changed)
-                if (m_TaperDependencies.Contains(entity) ||
-                    (EntityManager.TryGetComponent(entity, out Owner owner) && m_TaperDependencies.Contains(owner.m_Owner)))
+            {
+                Entity dependency = entity;
+                if (!m_TaperDependencies.Contains(dependency) && EntityManager.TryGetComponent(entity, out Owner owner))
+                    dependency = owner.m_Owner;
+                if (!m_TaperDependencies.Contains(dependency) || !checkedOwners.Add(dependency)) continue;
+                bool deleted = !EntityManager.Exists(dependency) || EntityManager.HasComponent<Deleted>(dependency);
+                if (deleted || (TryCaptureTaperStamp(dependency, out var current) &&
+                    (!m_TaperDependencyStamps.TryGetValue(dependency, out var saved) || !saved.Equals(current))))
                 {
                     ClearTaperPlans();
                     m_Dirty = true;
                     return;
                 }
+            }
         }
 
         private bool TryPlanIntersectionTaper(RoadGrassResolvedMedianAnchor anchor,
@@ -139,8 +215,8 @@ namespace RoadGrass
             // Preview failures are cached too. Only road/node/lane events discard them.
             var plan = new TaperPlan { Source = anchor, NodeComposition = source, Edge = edge, Node = node };
             m_TaperPlans[anchor.Key] = plan;
-            m_TaperDependencies.Add(anchor.Key.Edge);
-            m_TaperDependencies.Add(anchor.Node);
+            TrackTaperDependency(anchor.Key.Edge);
+            TrackTaperDependency(anchor.Node);
             if (!RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, anchor, out var approach) ||
                 !EntityManager.HasBuffer<ConnectedEdge>(anchor.Node)) return false;
 
@@ -149,12 +225,12 @@ namespace RoadGrass
             bool hasCars = false;
             bool AddLanes(Entity owner)
             {
-                m_TaperDependencies.Add(owner);
+                TrackTaperDependency(owner);
                 if (!EntityManager.HasBuffer<SubLane>(owner)) return false;
                 foreach (var item in EntityManager.GetBuffer<SubLane>(owner, true))
                 {
                     Entity lane = item.m_SubLane;
-                    m_TaperDependencies.Add(lane);
+                    TrackTaperDependency(lane);
                     if (!seen.Add(lane) || EntityManager.HasComponent<Deleted>(lane) || EntityManager.HasComponent<Game.Tools.Temp>(lane)) continue;
                     bool car = EntityManager.HasComponent<CarLane>(lane);
                     if (!car && !EntityManager.HasComponent<PedestrianLane>(lane) && !EntityManager.HasComponent<TrackLane>(lane)) continue;

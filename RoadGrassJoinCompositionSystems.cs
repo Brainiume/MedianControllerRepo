@@ -98,6 +98,9 @@ namespace RoadGrass
         private readonly Dictionary<RoadGrassMedianAnchorKey, RoadGrassResolvedMedianAnchor> m_Resolved = new();
         private readonly Dictionary<RoadGrassMedianAnchorKey, MedianRenderState> m_RenderStates = new();
         private readonly Dictionary<Entity, EdgeRuntimeStamp> m_EdgeStamps = new();
+        private readonly Dictionary<ulong, (RoadGrassResolvedMedianAnchor A, RoadGrassResolvedMedianAnchor B)> m_LastResolvedPairs = new();
+        private readonly HashSet<ulong> m_PendingPairIds = new();
+        private readonly HashSet<RoadGrassMedianAnchorKey> m_RetainedPairAnchors = new();
         private readonly Dictionary<EndpointCacheKey, List<RoadGrassResolvedMedianAnchor>> m_ResolveCache = new();
         private readonly List<RoadGrassMedianAnchorKey> m_RemoveKeys = new();
         private readonly List<RoadGrassMedianAnchorKey> m_PendingFinalize = new();
@@ -231,7 +234,9 @@ namespace RoadGrass
                 return;
             }
 
-            if (!m_Dirty && m_LastPendingPairCount == 0 &&
+            // Pending pairs wait for a network update; polling them rebuilt the
+            // entire city's median plans every frame while geometry was missing.
+            if (!m_Dirty &&
                 (!m_PendingSegmentSurfaces || UnityEngine.Time.frameCount % 30 != 0))
             {
                 return;
@@ -401,7 +406,7 @@ namespace RoadGrass
 
         internal void RemoveAnchorLinks(RoadGrassMedianAnchorKey key)
         {
-            ClearTaperPlans();
+            ClearTaperPlans(false);
             m_Dirty = true;
             if (!EntityManager.Exists(key.Edge) ||
                 !EntityManager.HasBuffer<RoadGrassMedianPieceLink>(key.Edge))
@@ -990,6 +995,8 @@ namespace RoadGrass
 
         private void RemovePersistentPair(ulong pairId)
         {
+            m_LastResolvedPairs.Remove(pairId);
+            m_PendingPairIds.Remove(pairId);
             if (pairId == 0 ||
                 !TryGetPersistentPairs(create: false, out var pairs))
             {
@@ -1041,7 +1048,7 @@ namespace RoadGrass
             int pending = 0;
             if (TryGetPersistentPairs(create: false, out var pairs))
             {
-                pending = math.max(0, pairs.Length - m_ActivePairs.Count / 2);
+                pending = math.max(m_PendingPairIds.Count, pairs.Length - m_ActivePairs.Count / 2);
             }
             if (pending != m_LastPendingPairCount)
             {
@@ -1066,14 +1073,14 @@ namespace RoadGrass
             }
 
             var invalid = new List<Entity>();
-            m_Dirty = true;
             for (int i = 0; i < changed.Length; i++)
             {
                 Entity edge = changed[i];
-                InvalidateTransitions(edge);
                 if (edge == Entity.Null || !EntityManager.Exists(edge) ||
                     EntityManager.HasComponent<Deleted>(edge))
                 {
+                    m_Dirty = true;
+                    InvalidateTransitions(edge);
                     invalid.Add(edge);
                     continue;
                 }
@@ -1083,6 +1090,7 @@ namespace RoadGrass
                 // successfully produced the connection.
                 if (!m_EdgeStamps.TryGetValue(edge, out EdgeRuntimeStamp saved))
                 {
+                    if (TryCaptureEdgeStamp(edge, out _)) m_Dirty = true;
                     continue;
                 }
 
@@ -1091,6 +1099,8 @@ namespace RoadGrass
                 if (TryCaptureEdgeStamp(edge, out EdgeRuntimeStamp current) &&
                     !saved.Equals(current))
                 {
+                    m_Dirty = true;
+                    InvalidateTransitions(edge);
                     // Keep the saved pair and rematch its medians after rebuilding.
                     // Both halves must lose their cached curves or equal-width joins
                     // would continue rendering the old geometry indefinitely.
@@ -1100,6 +1110,12 @@ namespace RoadGrass
                             m_RemoveKeys.Add(entry.Key);
                     foreach (var key in m_RemoveKeys) m_RenderStates.Remove(key);
                     m_EdgeStamps[edge] = current;
+                }
+                else if (m_LastPendingPairCount > 0)
+                {
+                    // A generated composition may have become available even
+                    // though its road curves did not change. Retry on this event.
+                    m_Dirty = true;
                 }
             }
 
@@ -1131,6 +1147,7 @@ namespace RoadGrass
 
             foreach (KeyValuePair<RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey> pair in m_ActivePairs)
             {
+                if (m_RetainedPairAnchors.Contains(pair.Key)) continue;
                 if (m_RenderStates.TryGetValue(pair.Key, out MedianRenderState existing) &&
                     existing.Paired.Equals(pair.Value) &&
                     m_Resolved.TryGetValue(pair.Key, out var existingA) &&
@@ -1150,7 +1167,7 @@ namespace RoadGrass
             }
         }
 
-        private void CachePairGeometry(
+        private bool CachePairGeometry(
             RoadGrassResolvedMedianAnchor a,
             RoadGrassResolvedMedianAnchor b,
             EdgeGeometry aGeometry,
@@ -1159,7 +1176,7 @@ namespace RoadGrass
             BatchDataHelpers.CompositionParameters aParameters, bParameters;
             if (math.abs(a.Width - b.Width) > 0.01f)
             {
-                if (!TryPlanTransition(a, b, aGeometry, bGeometry, out var transition)) return;
+                if (!TryPlanTransition(a, b, aGeometry, bGeometry, out var transition)) return false;
                 BatchDataHelpers.CalculateNodeParameters(transition.A.Geometry, transition.A.Composition, out aParameters);
                 BatchDataHelpers.CalculateNodeParameters(transition.B.Geometry, transition.B.Composition, out bParameters);
             }
@@ -1171,7 +1188,7 @@ namespace RoadGrass
             if (m_RenderStates.TryGetValue(a.Key, out var oldA) && oldA.Paired.Equals(b.Key) &&
                 m_RenderStates.TryGetValue(b.Key, out var oldB) && oldB.Paired.Equals(a.Key) &&
                 oldA.Parameters.Equals(aParameters) && oldB.Parameters.Equals(bParameters) &&
-                oldA.Bounds.Equals(aGeometry.m_Bounds) && oldB.Bounds.Equals(bGeometry.m_Bounds)) return;
+                oldA.Bounds.Equals(aGeometry.m_Bounds) && oldB.Bounds.Equals(bGeometry.m_Bounds)) return true;
             m_RenderStates[a.Key] = new MedianRenderState(
                 b.Key,
                 aParameters,
@@ -1183,6 +1200,7 @@ namespace RoadGrass
             CaptureEdgeStamp(a.Key.Edge);
             CaptureEdgeStamp(b.Key.Edge);
             AdvanceRenderRevision();
+            return true;
         }
 
         private void CaptureEdgeStamp(Entity edge)
@@ -1254,14 +1272,18 @@ namespace RoadGrass
         {
             m_ActivePairs.Clear();
             m_Resolved.Clear();
-            if (m_LinkedEdgesQuery.IsEmptyIgnoreFilter)
+            m_PendingPairIds.Clear();
+            m_RetainedPairAnchors.Clear();
+            if (m_AllLinkedEdgesQuery.IsEmptyIgnoreFilter)
             {
                 ReportPendingPersistentPairs();
                 return;
             }
 
             SeedPairIdAllocator();
-            using NativeArray<Entity> edges = m_LinkedEdgesQuery.ToEntityArray(Allocator.Temp);
+            // Composition may be absent during a rebuild; its absence must not
+            // exclude durable links before their cached geometry can be retained.
+            using NativeArray<Entity> edges = m_AllLinkedEdgesQuery.ToEntityArray(Allocator.Temp);
             for (int i = 0; i < edges.Length; i++)
             {
                 Entity edge = edges[i];
@@ -1292,12 +1314,24 @@ namespace RoadGrass
                         // become available several updates after save entities
                         // have deserialized.  Keep the durable pair and its
                         // mirrors intact so it can be rematched later.
+                        RetainPendingPair(link.PairId);
                         continue;
                     }
 
                     if (local.Node == Entity.Null || local.Node != paired.Node ||
                         local.Key.Edge == paired.Key.Edge)
                     {
+                        // Generated anchors can disagree while compositions are rebuilding.
+                        // Delete only when the roads themselves confirm a disconnected junction.
+                        bool disconnected = edge == link.PairedEdge;
+                        if (EntityManager.TryGetComponent(edge, out Edge aEdge) &&
+                            EntityManager.TryGetComponent(link.PairedEdge, out Edge bEdge))
+                        {
+                            Entity aNode = link.Local.End ? aEdge.m_End : aEdge.m_Start;
+                            Entity bNode = link.Paired.End ? bEdge.m_End : bEdge.m_Start;
+                            disconnected |= aNode != Entity.Null && bNode != Entity.Null && aNode != bNode;
+                        }
+                        if (!disconnected) { RetainPendingPair(link.PairId); continue; }
                         RemovePersistentPair(link.PairId);
                         RemoveCounterpart(edge, link);
                         links.RemoveAt(j);
@@ -1319,34 +1353,33 @@ namespace RoadGrass
                         // EdgeGeometry is also generated asynchronously while
                         // loading.  A failed visual calculation is not proof
                         // that the player's saved link is invalid.
+                        RetainPendingPair(link.PairId);
                         continue;
                     }
-
-                    link.Local = local.Data;
-                    link.Paired = paired.Data;
-                    links[j] = link;
                     if ((m_ActivePairs.TryGetValue(local.Key, out var existing) &&
                          !existing.Equals(paired.Key)) ||
                         (m_ActivePairs.TryGetValue(paired.Key, out var pairedExisting) &&
                          !pairedExisting.Equals(local.Key)))
                     {
-                        RemovePersistentPair(link.PairId);
-                        RemoveCounterpart(edge, link);
-                        links.RemoveAt(j);
+                        // Ambiguous rematching is not an explicit removal request.
+                        RetainPendingPair(link.PairId);
                         continue;
                     }
-                    if (!hasCachedGeometry)
+                    link.Local = local.Data;
+                    link.Paired = paired.Data;
+                    links[j] = link;
+                    if (!hasCachedGeometry && !CachePairGeometry(
+                            local, paired, localGeometry, pairedGeometry))
                     {
-                        CachePairGeometry(
-                            local,
-                            paired,
-                            localGeometry,
-                            pairedGeometry);
+                        RetainPendingPair(link.PairId);
+                        continue;
                     }
                     m_ActivePairs[local.Key] = paired.Key;
                     m_ActivePairs[paired.Key] = local.Key;
                     m_Resolved[local.Key] = local;
                     m_Resolved[paired.Key] = paired;
+                    m_LastResolvedPairs[link.PairId] = (local, paired);
+                    m_PendingPairIds.Remove(link.PairId);
                     EnsureCounterpart(edge, link);
                     UpsertPersistentPair(
                         new RoadGrassSavedMedianPair(
@@ -1363,7 +1396,36 @@ namespace RoadGrass
                 }
             }
 
+            PruneTransitionPlans();
             ReportPendingPersistentPairs();
+        }
+
+        private void RetainPendingPair(ulong pairId)
+        {
+            m_PendingPairIds.Add(pairId);
+            if (!m_LastResolvedPairs.TryGetValue(pairId, out var pair) ||
+                !CanRetain(pair.A, pair.B.Key) || !CanRetain(pair.B, pair.A.Key) ||
+                (m_ActivePairs.TryGetValue(pair.A.Key, out var a) && !a.Equals(pair.B.Key)) ||
+                (m_ActivePairs.TryGetValue(pair.B.Key, out var b) && !b.Equals(pair.A.Key))) return;
+            m_ActivePairs[pair.A.Key] = pair.B.Key;
+            m_ActivePairs[pair.B.Key] = pair.A.Key;
+            m_Resolved[pair.A.Key] = pair.A;
+            m_Resolved[pair.B.Key] = pair.B;
+            m_RetainedPairAnchors.Add(pair.A.Key);
+            m_RetainedPairAnchors.Add(pair.B.Key);
+
+            bool CanRetain(RoadGrassResolvedMedianAnchor anchor, RoadGrassMedianAnchorKey paired)
+            {
+                Entity edge = anchor.Key.Edge;
+                if (!EntityManager.Exists(edge) || EntityManager.HasComponent<Deleted>(edge) ||
+                    !EntityManager.TryGetComponent(edge, out Edge road) ||
+                    (anchor.Key.End ? road.m_End : road.m_Start) != anchor.Node ||
+                    !m_RenderStates.TryGetValue(anchor.Key, out var rendered) || !rendered.Paired.Equals(paired) ||
+                    !m_EdgeStamps.TryGetValue(edge, out var saved)) return false;
+                // Missing generated geometry is temporary; changed geometry must be rebuilt.
+                return road.m_Start == saved.Start && road.m_End == saved.End &&
+                    (!TryCaptureEdgeStamp(edge, out var current) || saved.Equals(current));
+            }
         }
 
         private bool TryResolveSavedAnchor(
@@ -1395,6 +1457,14 @@ namespace RoadGrass
 
             foreach (KeyValuePair<RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey> pair in m_RenderPairs)
             {
+                // Preserve the styled mesh too while its source composition is rebuilding.
+                if (m_RetainedPairAnchors.Contains(pair.Key) &&
+                    m_Variants.TryGetValue(pair.Key, out var retained) &&
+                    EntityManager.Exists(retained.Carrier) && EntityManager.Exists(retained.MedianComposition))
+                {
+                    EnsureCarrierRequested(retained);
+                    continue;
+                }
                 RoadGrassResolvedMedianAnchor anchor = m_ManualKeys.ContainsKey(pair.Key) || m_PolygonRenderKeys.Contains(pair.Key)
                     ? m_Resolved[pair.Key] : GetStyledContinuation(m_Resolved[pair.Key]);
                 if (!m_RenderStates.ContainsKey(pair.Key)) continue;
@@ -1816,6 +1886,10 @@ namespace RoadGrass
             m_RenderStates.Clear();
             m_TransitionPlans.Clear();
             m_EdgeStamps.Clear();
+            m_StyledEdgeStamps.Clear();
+            m_LastResolvedPairs.Clear();
+            m_PendingPairIds.Clear();
+            m_RetainedPairAnchors.Clear();
             m_SharedVariants.Clear();
             m_PendingFinalize.Clear();
         }

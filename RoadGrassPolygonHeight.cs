@@ -39,7 +39,7 @@ namespace RoadGrass
                     foreach (var connected in EntityManager.GetBuffer<ConnectedEdge>(source.Node, true))
                     {
                         Entity edge = connected.m_Edge;
-                        m_TaperDependencies.Add(edge);
+                        TrackTaperDependency(edge);
                         if (!EntityManager.TryGetComponent(edge, out Edge data)) continue;
                         if (data.m_Start == source.Node && EntityManager.TryGetComponent(edge, out StartNodeGeometry start)) Add(start.m_Geometry);
                         if (data.m_End == source.Node && EntityManager.TryGetComponent(edge, out EndNodeGeometry end)) Add(end.m_Geometry);

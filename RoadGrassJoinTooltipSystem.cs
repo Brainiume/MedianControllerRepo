@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Game;
 using Game.Input;
 using Game.Tools;
@@ -53,6 +54,7 @@ namespace RoadGrass
     {
         private ToolSystem m_ToolSystem;
         private RoadGrassJoinToolSystem m_JoinToolSystem;
+        private readonly HashSet<Game.UI.Widgets.PathSegment> m_InputHintPaths = new();
 
         [Preserve]
         protected override void OnCreate()
@@ -65,6 +67,7 @@ namespace RoadGrass
         [Preserve]
         protected override void OnUpdate()
         {
+            m_InputHintPaths.Clear();
             if (m_ToolSystem.activeTool != m_JoinToolSystem)
             {
                 return;
@@ -115,7 +118,7 @@ namespace RoadGrass
                 if (!action.enabled) return;
                 var hint = new InputHintTooltip(action);
                 hint.Refresh(device);
-                AddMouseTooltip(hint);
+                if (m_InputHintPaths.Add(hint.path)) AddMouseTooltip(hint);
             }
             if (input is ProxyAction action) Add(action);
             else if (input is UIBaseInputAction.IState state)

@@ -15,7 +15,7 @@ namespace RoadGrass
         internal struct Profile
         {
             internal float2 Insets, CurbU;
-            internal float CurbWidth, Height, GrassHeight, BaseHeight, TextureScale, TopInset, CurbV;
+            internal float CurbWidth, Height, GrassHeight, BaseHeight, TextureScale, TopInset, CurbV, AttachmentWidth;
             internal List<CurbVertex> Section;
         }
 
@@ -204,9 +204,26 @@ namespace RoadGrass
                 var wallLoops = new List<RoadGrassPolygonShape.Loop>();
                 if (profile.Section != null)
                     foreach (var vertex in profile.Section)
-                        wallLoops.Add(RoadGrassPolygonShape.Offset(loop, vertex.Depth, 0));
+                    {
+                        var wall = RoadGrassPolygonShape.Offset(loop, vertex.Depth, 0);
+                        PinSeam(wall, vertex.Depth);
+                        wallLoops.Add(wall);
+                    }
                 var interiors = RoadGrassPolygonShape.Build(loop.Points, loop.Opening, new float4(curbWidth, 0, 0, 0));
                 var tops = RoadGrassPolygonShape.Build(loop.Points, loop.Opening, new float4(profile.TopInset, 0, 0, 0));
+                foreach (var inner in interiors) PinSeam(inner, curbWidth);
+                foreach (var top in tops) PinSeam(top, profile.TopInset);
+                void PinSeam(RoadGrassPolygonShape.Loop contour, float inset)
+                {
+                    if (profile.AttachmentWidth <= 0) return;
+                    for (int i = 0; i < loop.Points.Count; i++)
+                    {
+                        if (!loop.Opening[i]) continue;
+                        RoadGrassPolygonShape.PinOpening(contour, loop.Points[i], loop.Points[(i + 1) % loop.Points.Count],
+                            profile.AttachmentWidth, new float2(inset));
+                        break;
+                    }
+                }
                 if (!useGrass || interiors.Count == 0)
                 {
                     foreach (var surface in tops) Fill(surface.Points, pavement, 0);
@@ -258,7 +275,7 @@ namespace RoadGrass
                 float signedArea = 0;
                 for (int i = 0; i < loop.Points.Count; i++)
                 {
-                    float3 a = loop.Points[i], b = loop.Points[(i + 1) % loop.Points.Count];
+                    float3 a = loop.Points[i] - loop.Points[0], b = loop.Points[(i + 1) % loop.Points.Count] - loop.Points[0];
                     signedArea += a.x * b.z - a.z * b.x;
                 }
                 for (int i = 0; i < loop.Points.Count; i++)

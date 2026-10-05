@@ -249,8 +249,17 @@ namespace RoadGrass
                     else if (emitted.Add(piece.m_SectionIndex)) pieces.AddRange(plan.Pieces);
                 }
                 if (m_SegmentMeshes.TryGetValue(entry.Key, out var current) && current.Source == source &&
-                    EntityManager.TryGetComponent(entry.Key, out Composition actual) && actual.m_Edge == current.Variant &&
-                    CompositionPiecesEqual(current.Pieces, pieces)) continue;
+                    EntityManager.Exists(current.Variant) && CompositionPiecesEqual(current.Pieces, pieces))
+                {
+                    var actual = EntityManager.GetComponentData<Composition>(entry.Key);
+                    if (actual.m_Edge != current.Variant)
+                    {
+                        actual.m_Edge = current.Variant;
+                        EntityManager.SetComponentData(entry.Key, actual);
+                        MarkEndpointBatches(entry.Key);
+                    }
+                    continue;
+                }
                 RestoreSegmentMesh(entry.Key);
                 var variant = EntityManager.Instantiate(source);
                 var buffer = EntityManager.GetBuffer<NetCompositionPiece>(variant);
