@@ -1101,15 +1101,7 @@ namespace RoadGrass
                 {
                     m_Dirty = true;
                     InvalidateTransitions(edge);
-                    // Keep the saved pair and rematch its medians after rebuilding.
-                    // Both halves must lose their cached curves or equal-width joins
-                    // would continue rendering the old geometry indefinitely.
-                    m_RemoveKeys.Clear();
-                    foreach (var entry in m_RenderStates)
-                        if (entry.Key.Edge == edge || entry.Value.Paired.Edge == edge)
-                            m_RemoveKeys.Add(entry.Key);
-                    foreach (var key in m_RemoveKeys) m_RenderStates.Remove(key);
-                    m_EdgeStamps[edge] = current;
+                    invalid.Add(edge);
                 }
                 else if (m_LastPendingPairCount > 0)
                 {
@@ -1123,8 +1115,8 @@ namespace RoadGrass
             {
                 Entity edge = invalid[i];
                 Mod.TryInfo(
-                    $"Removing median joins from {edge}: source road was deleted");
-                RestoreEdgeToVanilla(edge);
+                    $"Removing median joins from {edge}: source road changed or was deleted");
+                RemoveGeneratedMediansForGeometry(edge);
                 m_EdgeStamps.Remove(edge);
             }
         }

@@ -63,11 +63,10 @@ namespace RoadGrass
 
         internal void ClearStylePreviewCache()
         {
-            ClearTaperPlans(false);
-            m_SegmentAnchors.Clear();
-            m_SegmentPlans.Clear();
-            m_StylePlans.Clear();
-            m_SurfaceContinuations.Clear();
+            m_ManualPreviewSet = false;
+            m_PolygonPreviewPoints = null;
+            // Plans are keyed by source composition/style and invalidated on road changes.
+            // Clearing selection must not turn the next edit into a city-wide cold rebuild.
             m_ResolveCache.Clear();
         }
 
@@ -273,8 +272,11 @@ namespace RoadGrass
 
         private void StoreEndpointStyle(RoadGrassSavedEndpointStyle style)
         {
-            ClearTaperPlans();
+            if (m_Styles.TryGetValue(style.Key, out var current) && current.Equals(style)) return;
+            // Endpoint edits must not rebuild every generated median in the city.
+            m_TaperPlans.Remove(style.Key);
             bool empty = style.Cap == MedianSavedCap.None && style.Surface == MedianSavedSurface.None && !style.ExtendIntoIntersection;
+            if (empty && !m_Styles.ContainsKey(style.Key)) return;
             if (!TryGetEndpointStyles(!empty, out var styles))
             {
                 m_Dirty = true;
@@ -538,7 +540,7 @@ namespace RoadGrass
                 m_StyledEdgeStamps[edge] = current;
             }
             else m_StyledEdgeStamps.Remove(edge);
-            ClearTaperPlans();
+            RemoveGeneratedMediansForGeometry(edge);
             InvalidateTransitions(edge);
             m_SegmentAnchors.Remove(edge);
             m_SegmentPlans.Clear();

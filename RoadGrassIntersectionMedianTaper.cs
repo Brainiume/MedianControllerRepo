@@ -62,16 +62,21 @@ namespace RoadGrass
             // existing polygons' sections, profiles and renderer resources.
             if (!geometryChanged) return;
             m_PolygonPlanEpoch++;
+            ClearRoadGuideCaches();
+            m_PolygonProfiles.Clear();
+            m_TaperDependencies.Clear();
+            m_TaperDependencyStamps.Clear();
+        }
+
+        private void ClearRoadGuideCaches()
+        {
             m_PolygonReferenceGuides.Clear();
             m_TaperSnapPoints.Clear();
             foreach (var builder in m_TaperSnapBuilders.Values) builder.Dispose();
             m_TaperSnapBuilders.Clear();
             m_PolygonGuides.Clear(); m_PolygonGuideEdges.Clear();
             m_PolygonRoadSurfaces.Clear();
-            m_PolygonProfiles.Clear();
             m_MarkingGuides.Clear();
-            m_TaperDependencies.Clear();
-            m_TaperDependencyStamps.Clear();
         }
 
         private void TrackTaperDependency(Entity entity)
@@ -150,11 +155,59 @@ namespace RoadGrass
                 if (deleted || (TryCaptureTaperStamp(dependency, out var current) &&
                     (!m_TaperDependencyStamps.TryGetValue(dependency, out var saved) || !saved.Equals(current))))
                 {
-                    ClearTaperPlans();
-                    m_Dirty = true;
-                    return;
+                    RemoveGeneratedMediansForGeometry(dependency);
+                    if (deleted)
+                    {
+                        m_TaperDependencies.Remove(dependency);
+                        m_TaperDependencyStamps.Remove(dependency);
+                    }
+                    else if (TryCaptureTaperStamp(dependency, out var updated))
+                        m_TaperDependencyStamps[dependency] = updated;
                 }
             }
+        }
+
+        private void RemoveGeneratedMediansForGeometry(Entity dependency)
+        {
+            // Include deleted nodes whose Node component may already be gone.
+            var nodes = new HashSet<Entity> { dependency };
+            if (EntityManager.TryGetComponent(dependency, out Edge road))
+            { nodes.Add(road.m_Start); nodes.Add(road.m_End); }
+            if (m_TaperDependencyStamps.TryGetValue(dependency, out var previous) ||
+                m_EdgeStamps.TryGetValue(dependency, out previous))
+            { nodes.Add(previous.Start); nodes.Add(previous.End); }
+            nodes.Remove(Entity.Null);
+
+            bool Affected(Entity edge, Entity node) => edge == dependency || nodes.Contains(node);
+            bool AffectedAnchor(Entity edge, RoadGrassMedianAnchorData anchor) => edge == dependency ||
+                (EntityManager.TryGetComponent(edge, out Edge data) && nodes.Contains(anchor.End ? data.m_End : data.m_Start));
+
+            var pairIds = new List<ulong>();
+            if (TryGetPersistentPairs(false, out var pairs))
+                for (int i = 0; i < pairs.Length; i++)
+                    if (AffectedAnchor(pairs[i].EdgeA, pairs[i].AnchorA) || AffectedAnchor(pairs[i].EdgeB, pairs[i].AnchorB))
+                        pairIds.Add(pairs[i].PairId);
+            foreach (var id in pairIds) RemovePairById(id);
+            if (EntityManager.HasComponent<Edge>(dependency) || m_EdgeStamps.ContainsKey(dependency))
+                RestoreEdgeToVanilla(dependency);
+
+            var manualIds = new List<int>();
+            foreach (var entry in m_ManualMedians)
+                if (Affected(entry.Value.Saved.Edge, entry.Value.Saved.Node)) manualIds.Add(entry.Key);
+            foreach (var id in manualIds) RemoveManualMedian(id);
+            foreach (var style in new List<RoadGrassSavedEndpointStyle>(m_Styles.Values))
+            {
+                if (!style.ExtendIntoIntersection || !Affected(style.Edge, style.Node)) continue;
+                var ordinary = style;
+                ordinary.ExtendIntoIntersection = false;
+                ordinary.HasTaperEnd = false;
+                ordinary.TaperEndOffset = default;
+                StoreEndpointStyle(ordinary);
+                RemoveVariant(style.Key);
+            }
+            // New drawing needs fresh guides; surviving polygons keep their mesh/material resources.
+            ClearRoadGuideCaches();
+            m_Dirty = true;
         }
 
         private bool TryPlanIntersectionTaper(RoadGrassResolvedMedianAnchor anchor,

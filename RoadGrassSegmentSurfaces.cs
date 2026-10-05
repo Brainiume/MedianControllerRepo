@@ -155,11 +155,14 @@ namespace RoadGrass
 
         private void StoreSegmentSurface(RoadGrassResolvedMedianAnchor anchor, MedianSavedSurface surface)
         {
-            InvalidateTransitions(anchor.Key.Edge);
             var identity = anchor.Data;
             identity.End = false;
             if (TryGetSegmentAnchor(anchor.Key.Edge, anchor.Key.Ordinal, out var segment)) identity = segment.Data;
             var record = new RoadGrassSavedSegmentSurface { Edge = anchor.Key.Edge, Median = identity, Surface = surface };
+            if (m_SegmentSurfaces.TryGetValue(record.Key, out var current)
+                ? current.Surface == surface && current.Median.Equals(identity)
+                : surface == MedianSavedSurface.None) return;
+            InvalidateTransitions(anchor.Key.Edge);
             if (surface == MedianSavedSurface.None) m_SegmentSurfaces.Remove(record.Key);
             else { m_SegmentSurfaces[record.Key] = record; TrackStyledEdge(record.Edge); }
             if (TryGetSegmentSurfaces(surface != MedianSavedSurface.None, out var records))

@@ -20,6 +20,10 @@ namespace RoadGrass
 
         public void OnLoad(UpdateSystem updateSystem)
         {
+            m_Settings = new RoadGrassSettings(this);
+            Colossal.IO.AssetDatabase.AssetDatabase.global.LoadSettings("MedianController", m_Settings);
+            m_Settings.Apply();
+
             TryInfo($"{nameof(OnLoad)} median-controller-endpoint-styles-v1");
             TryInfo("Build marker: segment-median-surfaces-v4");
 
@@ -28,13 +32,11 @@ namespace RoadGrass
                 TryInfo($"Current mod asset at {asset.path}");
             }
 
-            m_Settings = new RoadGrassSettings(this);
-            Colossal.IO.AssetDatabase.AssetDatabase.global.LoadSettings("MedianController", m_Settings);
-            m_Settings.Apply();
             GameManager.instance.localizationManager.AddSource("en-US", new LocaleEN(m_Settings));
             m_Settings.RegisterInOptionsUI();
             m_Settings.RegisterKeyBindings();
             CloseToolAction = m_Settings.GetAction(RoadGrassSettings.CloseTool);
+            if (CloseToolAction != null) CloseToolAction.shouldBeEnabled = false;
 
             updateSystem.UpdateAt<RoadGrassPrefabSystem>(SystemUpdatePhase.UIUpdate);
             updateSystem.UpdateAt<RoadGrassUISystem>(SystemUpdatePhase.UIUpdate);
@@ -83,6 +85,7 @@ namespace RoadGrass
         {
             RoadGrassPolygonPrototypeBatchSystem.Instance?.Shutdown();
             m_Settings?.UnregisterInOptionsUI();
+            if (CloseToolAction != null) CloseToolAction.shouldBeEnabled = false;
             CloseToolAction = null;
             m_Settings = null;
             TryInfo(nameof(OnDispose));
@@ -110,6 +113,7 @@ namespace RoadGrass
 
         private static void TryWrite(Level level, string message)
         {
+            if (!RoadGrassSettings.VerboseLoggingEnabled) return;
             try
             {
                 if (Log is UnityLogger logger && logger.isLevelEnabled(level))

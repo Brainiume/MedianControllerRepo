@@ -1,6 +1,4 @@
 using System;
-using System.IO;
-using System.Reflection;
 using UnityEngine;
 using Colossal.IO.AssetDatabase;
 using Game.Prefabs;
@@ -13,12 +11,11 @@ namespace RoadGrass
     // Runtime renderer cache only. No resource handles belong in saved city data.
     internal sealed class RoadGrassPolygonPrototypeResources : IDisposable
     {
-        private AssetBundle m_Bundle;
         internal Material Pavement { get; private set; }
         internal Material Grass { get; private set; }
 
         internal static void CopyMedianMaterials(EntityManager manager, PrefabSystem prefabs,
-            RoadGrassResolvedMedianAnchor source, out Material pavement, out Material grass, out List<TextureAsset> textures)
+            RoadGrassResolvedMedianAnchor source, bool useGrass, out Material pavement, out Material grass, out List<TextureAsset> textures)
         {
             pavement = grass = null;
             textures = new List<TextureAsset>();
@@ -26,6 +23,9 @@ namespace RoadGrass
             {
                 foreach (var piece in source.Pieces)
                 {
+                    if (pavement != null && (!useGrass || grass != null)) break;
+                    if ((piece.m_PieceFlags & NetPieceFlags.Bottom) != 0 ||
+                        (piece.m_SectionFlags & (NetSectionFlags.Hidden | NetSectionFlags.Underground | NetSectionFlags.Overhead)) != 0) continue;
                     if (!manager.HasBuffer<MeshMaterial>(piece.m_Piece) ||
                         !prefabs.TryGetPrefab<RenderPrefab>(piece.m_Piece, out var prefab)) continue;
                     var materials = manager.GetBuffer<MeshMaterial>(piece.m_Piece, true);
@@ -36,35 +36,38 @@ namespace RoadGrass
                         // Source surface names distinguish the grass fill from the curb/pavement.
                         bool isGrass = surface.name.IndexOf("grass", StringComparison.OrdinalIgnoreCase) >= 0 ||
                             surface.name.IndexOf("lawn", StringComparison.OrdinalIgnoreCase) >= 0;
-                        if (isGrass ? grass != null : pavement != null) continue;
-                        var original = surface.GetTemplateMaterial();
-                        if (original == null || original.shader == null || !original.shader.isSupported) continue;
-                        var copy = new Material(original) { hideFlags = HideFlags.DontSave, enableInstancing = true };
-                        if (isGrass) grass = copy; else pavement = copy;
-                        // Match native CreateMaterial, but bind ordinary textures instead of VT stacks.
-                        surface.LoadProperties(useVT: false);
+                        if (isGrass ? !useGrass || grass != null : pavement != null) continue;
+                        // Load the header before reading its template hash, including cold assets.
                         try
                         {
-                            foreach (var property in surface.floats) copy.SetFloat(property.Key, property.Value);
-                            foreach (var property in surface.ints) copy.SetInt(property.Key, property.Value);
-                            foreach (var property in surface.vectors) copy.SetVector(property.Key, property.Value);
-                            foreach (var property in surface.colors) copy.SetColor(property.Key, property.Value);
-                            foreach (var keyword in surface.keywords) copy.EnableKeyword(keyword);
+                            surface.LoadProperties(useVT: false);
+                            var original = surface.GetTemplateMaterial();
+                            if (original == null || original.shader == null || !original.shader.isSupported) continue;
+                            var copy = new Material(original) { hideFlags = HideFlags.DontSave, enableInstancing = true };
+                            if (isGrass) grass = copy; else pavement = copy;
+                            // Match native material setup, but bind ordinary textures instead of VT stacks.
+                            foreach (var property in surface.floats) if (copy.HasProperty(property.Key)) copy.SetFloat(property.Key, property.Value);
+                            foreach (var property in surface.ints) if (copy.HasProperty(property.Key)) copy.SetInt(property.Key, property.Value);
+                            foreach (var property in surface.vectors) if (copy.HasProperty(property.Key)) copy.SetVector(property.Key, property.Value);
+                            foreach (var property in surface.colors) if (copy.HasProperty(property.Key)) copy.SetColor(property.Key, property.Value);
+                            foreach (var keyword in surface.keywords)
+                                if (copy.shader.keywordSpace.FindKeyword(keyword).isValid) copy.EnableKeyword(keyword);
                             foreach (var texture in surface.textures)
                             {
-                                if (texture.Value == null) continue;
-                                copy.SetTexture(texture.Key, texture.Value.Load());
+                                if (texture.Value == null || !copy.HasProperty(texture.Key)) continue;
+                                // Load increments the native refcount before reading the asset.
                                 textures.Add(texture.Value);
+                                copy.SetTexture(texture.Key, texture.Value.Load());
                             }
+                            copy.DisableKeyword("_TANGENTSPACE_OCTO");
+                            copy.DisableKeyword("ENABLE_VT");
+                            HDMaterial.ValidateMaterial(copy);
+                            Mod.TryInfo($"[PolygonMaterial] surface={surface.name} shader={copy.shader.name} grass={isGrass}");
                         }
                         finally { surface.UnloadProperties(); }
-                        copy.DisableKeyword("_TANGENTSPACE_OCTO");
-                        copy.DisableKeyword("ENABLE_VT");
-                        HDMaterial.ValidateMaterial(copy);
-                        Mod.TryInfo($"[PolygonMaterial] surface={surface.name} shader={copy.shader.name} grass={isGrass}");
                     }
                 }
-                if (pavement == null || grass == null)
+                if (pavement == null || (useGrass && grass == null))
                     Mod.TryWarn($"[PolygonMaterial] source material incomplete: pavement={pavement != null} grass={grass != null}; unmatched surfaces retain prototype fallback");
             }
             catch
@@ -72,6 +75,7 @@ namespace RoadGrass
                 if (pavement != null) UnityEngine.Object.Destroy(pavement);
                 if (grass != null) UnityEngine.Object.Destroy(grass);
                 foreach (var texture in textures) texture.Unload();
+                textures.Clear();
                 pavement = grass = null;
                 throw;
             }
@@ -98,15 +102,20 @@ namespace RoadGrass
                 }
                 else
                 {
-                    using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("RoadGrass.PolygonMedianShader"))
-                    using (var bytes = new MemoryStream())
+                    // Use the player's compiled shader, including its HDRP and
+                    // DOTS variants. A duplicate stock-Lit bundle adds no shading
+                    // behavior and older Unity bundles are rejected by this player.
+                    var shader = Shader.Find("HDRP/Lit");
+                    if (shader == null || !shader.isSupported)
+                        throw new InvalidOperationException("Native polygon fallback shader unavailable");
+                    template = resources.Pavement = new Material(shader)
                     {
-                        if (stream == null) throw new InvalidOperationException("Polygon shader bundle is missing");
-                        stream.CopyTo(bytes);
-                        resources.m_Bundle = AssetBundle.LoadFromMemory(bytes.ToArray());
-                    }
-                    if (resources.m_Bundle == null) throw new InvalidOperationException("Polygon shader bundle rejected by Unity " + Application.unityVersion + "; rebuild with the current CS2 modding-toolchain editor. Native fallback is active.");
-                    template = resources.m_Bundle.LoadAsset<Material>("assets/polygonmedian.mat");
+                        hideFlags = HideFlags.DontSave,
+                        enableInstancing = true
+                    };
+                    template.SetFloat("_Metallic", 0);
+                    template.SetFloat("_Smoothness", .25f);
+                    HDMaterial.ValidateMaterial(template);
                 }
                 if (template == null || template.shader == null || !template.shader.isSupported || template.passCount == 0)
                     throw new InvalidOperationException("Polygon shader is unsupported by this renderer");
@@ -114,7 +123,7 @@ namespace RoadGrass
                     resources.Pavement = new Material(template) { hideFlags = HideFlags.DontSave };
                 resources.Pavement.name = "Median Controller polygon pavement";
                 resources.Grass = new Material(template) { name = "Median Controller polygon grass", hideFlags = HideFlags.DontSave };
-                // ponytail: solid-color geometry prototype; copy source textures once batching is proven in CS2.
+                // Used only when the source median's native surface cannot be copied.
                 resources.Pavement.SetColor("_BaseColor", new Color(.45f, .45f, .43f, 1));
                 resources.Grass.SetColor("_BaseColor", new Color(.22f, .34f, .12f, 1));
                 reason = "";
@@ -136,8 +145,6 @@ namespace RoadGrass
             if (Grass != null) UnityEngine.Object.Destroy(Grass);
             Pavement = null;
             Grass = null;
-            if (m_Bundle != null) m_Bundle.Unload(true);
-            m_Bundle = null;
         }
     }
 }

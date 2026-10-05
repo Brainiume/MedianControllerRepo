@@ -26,6 +26,7 @@ namespace RoadGrass
         internal const float DefaultStretchFactor = 0.84f;
         private float m_NarrowMedianStretchFactor = DefaultStretchFactor;
         internal static float AppliedStretchFactor { get; private set; } = DefaultStretchFactor;
+        internal static bool VerboseLoggingEnabled { get; private set; }
         public RoadGrassSettings(IMod mod) : base(mod)
         {
             SetDefaults();
@@ -34,7 +35,11 @@ namespace RoadGrass
         public override void SetDefaults()
         {
             NarrowMedianStretchFactor = DefaultStretchFactor;
+            VerboseLogging = false;
         }
+
+        [SettingsUISection("General", "Logging")]
+        public bool VerboseLogging { get; set; }
 
         [SettingsUISection("General", "Transitions")]
         [SettingsUISlider(min = 0.5f, max = 1.5f, step = 0.01f, scalarMultiplier = 1, unit = Unit.kFloatTwoFractions)]
@@ -47,6 +52,7 @@ namespace RoadGrass
 
         public override void Apply()
         {
+            VerboseLoggingEnabled = VerboseLogging;
             if (AppliedStretchFactor != NarrowMedianStretchFactor)
             {
                 AppliedStretchFactor = NarrowMedianStretchFactor;

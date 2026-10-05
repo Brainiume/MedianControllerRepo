@@ -246,7 +246,7 @@ namespace RoadGrass
             RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
             if (median.Points.Count == 2) m_ManualKeys.Remove(median.Saved.Key);
             if(SelectedManualMedianId==id)SelectedManualMedianId=0;
-            ClearTaperPlans(false);m_Dirty=true;ManualMessage="";
+            m_TaperPlans.Remove(median.Saved.Key);m_Dirty=true;ManualMessage="";
         }
         private bool TryResolveManual(ManualMedian median,out RoadGrassResolvedMedianAnchor anchor,out float3 destination)
         {

@@ -38,8 +38,6 @@ namespace RoadGrass
         private ValueBinding<string> m_ManualMessageBinding;
         private ValueBinding<bool> m_PolygonSelectedBinding, m_PolygonOpeningBinding;
         private ValueBinding<float> m_LineOffsetBinding, m_MedianOffsetBinding, m_LineRadiusBinding, m_MedianRadiusBinding, m_OffsetLimitBinding;
-        private bool m_Synchronizing;
-        private bool m_MedianActivationPending;
 
         internal MedianControllerMode ActiveMode { get; private set; } = MedianControllerMode.Connect;
         internal MedianCapChoice EditCapChoice { get; private set; } = MedianCapChoice.Rounded;
@@ -55,6 +53,14 @@ namespace RoadGrass
             m_ToolSystem = World.GetOrCreateSystemManaged<ToolSystem>();
             m_NetToolSystem = World.GetOrCreateSystemManaged<NetToolSystem>();
             m_JoinToolSystem = World.GetOrCreateSystemManaged<RoadGrassJoinToolSystem>();
+            // ActivatePrefabTool uses the first tool accepting the prefab. Claim our
+            // asset before NetToolSystem, which accepts every NetPrefab (including ours).
+            int netIndex = m_ToolSystem.tools.IndexOf(m_NetToolSystem);
+            if (netIndex >= 0 && m_ToolSystem.tools.IndexOf(m_JoinToolSystem) > netIndex)
+            {
+                m_ToolSystem.tools.Remove(m_JoinToolSystem);
+                m_ToolSystem.tools.Insert(netIndex, m_JoinToolSystem);
+            }
             AddBinding(m_SnappingBinding = new ValueBinding<bool>(ModId, "PolygonSnapping", PolygonSnapping));
             AddBinding(m_PlacingPolygonPointsBinding = new ValueBinding<bool>(ModId, "PlacingPolygonPoints", false));
             AddBinding(new TriggerBinding<bool>(ModId, "SetPolygonSnapping", value =>
@@ -123,42 +129,19 @@ namespace RoadGrass
                 m_ResetBinding.Update(value);
             }));
             m_ToolSystem.EventToolChanged += OnToolChanged;
-            m_ToolSystem.EventPrefabChanged += OnPrefabChanged;
         }
 
         private void OnToolChanged(ToolBaseSystem tool)
         {
-            // Keep NetToolSystem's prefab valid for mods that inspect it on tool changes.
-            // Only a fresh prefab selection arms Median Controller activation.
-            if (tool != m_NetToolSystem) m_MedianActivationPending = false;
             SynchronizeTool();
-        }
-
-        private void OnPrefabChanged(PrefabBase prefab)
-        {
-            m_MedianActivationPending = prefab != null && prefab == m_NetToolSystem.prefab &&
-                prefab.name == RoadGrassPrefabSystem.PrefabName;
-            // NetToolSystem raises this before ActivatePrefabTool finishes selecting its tool.
-            // Redirect on the tool-change event (or the next UI update), never inside this event.
         }
 
         private void SynchronizeTool()
         {
-            if (m_Synchronizing) return;
-            m_Synchronizing = true;
-            try
-            {
-                if (m_MedianActivationPending && m_ToolSystem.activeTool == m_NetToolSystem &&
-                    m_NetToolSystem.prefab?.name == RoadGrassPrefabSystem.PrefabName)
-                {
-                    m_MedianActivationPending = false;
-                    m_JoinToolSystem.SetToolPrefab(m_NetToolSystem.prefab);
-                    m_ToolSystem.activeTool = m_JoinToolSystem;
-                }
-                m_IsActiveBinding.Update(m_ToolSystem.activeTool == m_JoinToolSystem &&
-                    m_JoinToolSystem.GetPrefab()?.name == RoadGrassPrefabSystem.PrefabName);
-            }
-            finally { m_Synchronizing = false; }
+            bool active = m_ToolSystem.activeTool == m_JoinToolSystem &&
+                m_JoinToolSystem.GetPrefab()?.name == RoadGrassPrefabSystem.PrefabName;
+            m_IsActiveBinding.Update(active);
+            if (!active) m_PlacingPolygonPointsBinding.Update(false);
         }
 
         internal void SetActiveMode(int value)
@@ -178,7 +161,8 @@ namespace RoadGrass
         protected override void OnUpdate()
         {
             base.OnUpdate();
-            if (m_MedianActivationPending) SynchronizeTool();
+            SynchronizeTool();
+            if (m_ToolSystem.activeTool != m_JoinToolSystem) return;
             var manager = RoadGrassJoinCompositionSystem.Instance;
             m_PlacingPolygonPointsBinding.Update(m_ToolSystem.activeTool == m_JoinToolSystem &&
                 ActiveMode == MedianControllerMode.Polygon && m_JoinToolSystem.HasPendingSelection);
@@ -200,7 +184,6 @@ namespace RoadGrass
         protected override void OnDestroy()
         {
             m_ToolSystem.EventToolChanged -= OnToolChanged;
-            m_ToolSystem.EventPrefabChanged -= OnPrefabChanged;
             base.OnDestroy();
         }
     }

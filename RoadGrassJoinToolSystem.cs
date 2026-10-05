@@ -103,11 +103,6 @@ namespace RoadGrass
         internal Game.Input.IProxyAction ApplyInput => applyAction;
         internal Game.Input.IProxyAction SecondaryApplyInput => secondaryApplyAction;
 
-        internal void SetToolPrefab(NetPrefab prefab)
-        {
-            m_ToolPrefab = prefab;
-        }
-
         public override PrefabBase GetPrefab() => m_ToolPrefab;
 
         public override bool TrySetPrefab(PrefabBase prefab)
@@ -141,11 +136,12 @@ namespace RoadGrass
         [Preserve]
         protected override void OnStartRunning()
         {
+            // Install the override before native action setup touches Cancel.
+            cancelActionOverride = Mod.CloseToolAction;
             base.OnStartRunning();
             applyAction.shouldBeEnabled = true;
             secondaryApplyAction.shouldBeEnabled = true;
             // Follow native keyboard/gamepad Cancel bindings without competing with mouse removal.
-            cancelActionOverride = Mod.CloseToolAction;
             cancelAction.shouldBeEnabled = true;
             m_FirstAnchor = null;
             m_MainCamera = Camera.main;
@@ -154,20 +150,18 @@ namespace RoadGrass
         [Preserve]
         protected override void OnStopRunning()
         {
+            // Native ResetActions disables the current actions before clearing overrides.
             base.OnStopRunning();
             ClearTransientSelection();
-            applyAction.shouldBeEnabled = false;
-            secondaryApplyAction.shouldBeEnabled = false;
-            cancelAction.shouldBeEnabled = false;
             m_MainCamera = null;
         }
 
         [Preserve]
         protected override JobHandle OnUpdate(JobHandle inputDeps)
         {
+            if (m_ToolSystem.activeTool != this) return inputDeps;
             if (cancelAction.WasPressedThisFrame())
             {
-                ClearTransientSelection();
                 m_ToolSystem.activeTool = m_DefaultToolSystem;
                 return inputDeps;
             }

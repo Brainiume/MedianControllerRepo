@@ -406,6 +406,7 @@ namespace RoadGrass
             if (!renderer.TryInitialize(out var error)) { reason = "Polygon mesh prototype unavailable: " + error; return false; }
             if (renderer.Matches(id, median.Sections, median.Saved.Surface, out bool accepted, out reason)) return accepted;
             if (!TryResolvePolygon(median, out source, out var points)) { renderer.Remove(id); return false; }
+            UnityEngine.Mesh mesh = null;
             try
             {
                 var loops = BuildPolygonLoops(source, points,
@@ -435,7 +436,7 @@ namespace RoadGrass
                     (styled.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
                 var projection = GetPolygonHeightProjection(source);
                 float3 ProjectFoot(float3 p) => (projection == null ? p : projection(p)) + new float3(0, profile.BaseHeight, 0);
-                var mesh = RoadGrassPolygonPrototypeMesh.Build(loops, origin, profile, ProjectFoot, grass);
+                mesh = RoadGrassPolygonPrototypeMesh.Build(loops, origin, profile, ProjectFoot, grass);
                 if (mesh == null)
                 { renderer.Remove(id); reason = "Polygon mesh contains no drawable geometry"; return false; }
                 var outline = new List<Line3.Segment>();
@@ -452,13 +453,15 @@ namespace RoadGrass
                     for (int sample = 0; sample < samples; sample++) outline.Add(new Line3.Segment(At(sample), At(sample + 1)));
                 }
                 RoadGrassPolygonPrototypeResources.CopyMedianMaterials(EntityManager,
-                    World.GetExistingSystemManaged<PrefabSystem>(), styled, out var pavementMaterial, out var grassMaterial, out var materialTextures);
+                    World.GetExistingSystemManaged<PrefabSystem>(), styled, grass, out var pavementMaterial, out var grassMaterial, out var materialTextures);
                 renderer.Submit(id, median.Sections, median.Saved.Surface, mesh, origin, grass, outline,
                     pavementMaterial, grassMaterial, materialTextures);
+                mesh = null; // Ownership transferred to the renderer.
                 return true;
             }
             catch (System.Exception exception)
             {
+                if (mesh != null) UnityEngine.Object.Destroy(mesh);
                 renderer.Remove(id);
                 reason = "Polygon mesh prototype: " + exception.Message;
                 return false;

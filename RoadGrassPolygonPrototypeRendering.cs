@@ -173,6 +173,7 @@ namespace RoadGrass
 
         protected override void OnUpdate()
         {
+            if (!RoadGrassSettings.VerboseLoggingEnabled) m_ReportPending = false;
             if (m_Pending.Count == 0 && m_Remove.Count == 0 && !m_ReportPending) return;
             // Structural changes are bounded to commit/edit/remove/load events, never hover or ordinary simulation.
             var groups = m_BatchManager.GetNativeBatchGroups(false, out var groupDeps);
@@ -208,7 +209,7 @@ namespace RoadGrass
             {
                 if (m_Entries.TryGetValue(request.Key, out var old)) Release(old, groups, instances, subBatches);
                 var entry = request.Value;
-                try { Register(entry, groups, instances, subBatches); entry.ReportPending = m_ReportPending = true; }
+                try { Register(entry, groups, instances, subBatches); entry.ReportPending = m_ReportPending = RoadGrassSettings.VerboseLoggingEnabled; }
                 catch (Exception exception)
                 {
                     Release(entry, groups, instances, subBatches);

@@ -83,10 +83,6 @@
 		<None Include="$(ModTargetsFile)" Link="Properties\Mod.targets" />
 	</ItemGroup>
 
-	<ItemGroup>
-		<EmbeddedResource Include="Assets\PolygonMedian\mediancontroller-polygon" LogicalName="RoadGrass.PolygonMedianShader" />
-	</ItemGroup>
-
 	<Target Name="InstallUI" AfterTargets="AfterBuild">
 		<Exec Command="npm run build" WorkingDirectory="$(ProjectDir)\UI" />
 	</Target>
