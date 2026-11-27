@@ -50,6 +50,7 @@ namespace RoadGrass
 
         internal void ClearTransientSelection()
         {
+            SetPolygonPointEditing(false);
             m_PolygonPoints.Clear();
             m_PolygonCornerStarts.Clear(); m_PolygonCornerSnaps.Clear();
             RoadGrassJoinCompositionSystem.Instance?.SelectManualMedian(0);
@@ -102,6 +103,8 @@ namespace RoadGrass
         public override string toolID => "RoadGrassJoinMedian";
         internal Game.Input.IProxyAction ApplyInput => applyAction;
         internal Game.Input.IProxyAction SecondaryApplyInput => secondaryApplyAction;
+        private Game.Input.InputBarrier m_MouseCancelBarrier;
+        private UnityEngine.InputSystem.InputAction m_NativeCancelAction;
 
         public override PrefabBase GetPrefab() => m_ToolPrefab;
 
@@ -136,12 +139,16 @@ namespace RoadGrass
         [Preserve]
         protected override void OnStartRunning()
         {
-            // Install the override before native action setup touches Cancel.
-            cancelActionOverride = Mod.CloseToolAction;
             base.OnStartRunning();
             applyAction.shouldBeEnabled = true;
             secondaryApplyAction.shouldBeEnabled = true;
-            // Follow native keyboard/gamepad Cancel bindings without competing with mouse removal.
+            // Keep the base activation wrapper: built-in actions cannot be enabled directly.
+            var nativeCancel = Game.Input.InputManager.instance.FindAction(Game.Input.InputManager.kToolMap, "Cancel");
+            foreach (var action in Game.Input.InputManager.instance)
+                if (action.actionMap.name == nativeCancel.mapName && action.name == nativeCancel.name)
+                { m_NativeCancelAction = action; break; }
+            m_MouseCancelBarrier = nativeCancel.CreateBarrier("Median Controller mouse cancel", Game.Input.InputManager.DeviceType.Mouse);
+            m_MouseCancelBarrier.blocked = true;
             cancelAction.shouldBeEnabled = true;
             m_FirstAnchor = null;
             m_MainCamera = Camera.main;
@@ -152,15 +159,26 @@ namespace RoadGrass
         {
             // Native ResetActions disables the current actions before clearing overrides.
             base.OnStopRunning();
+            m_MouseCancelBarrier?.Dispose();
+            m_MouseCancelBarrier = null;
+            m_NativeCancelAction = null;
             ClearTransientSelection();
             m_MainCamera = null;
         }
 
+        protected override void OnDestroy()
+        {
+            m_MouseCancelBarrier?.Dispose();
+            base.OnDestroy();
+        }
+
+        private readonly List<RoadGrassResolvedMedianAnchor> m_AnchorCandidates = new();
         [Preserve]
         protected override JobHandle OnUpdate(JobHandle inputDeps)
         {
             if (m_ToolSystem.activeTool != this) return inputDeps;
-            if (cancelAction.WasPressedThisFrame())
+            if (cancelAction.shouldBeEnabled && m_NativeCancelAction?.WasPressedThisFrame() == true &&
+                m_NativeCancelAction?.activeControl?.device is not UnityEngine.InputSystem.Mouse)
             {
                 m_ToolSystem.activeTool = m_DefaultToolSystem;
                 return inputDeps;
@@ -177,6 +195,9 @@ namespace RoadGrass
             bool hasCursorRay = TryGetCursorRay(
                 out Line3.Segment cursorRay,
                 out float fovTan);
+            if (manager != null && PolygonPointEditing)
+                return UpdatePolygonPoints(inputDeps, manager, hasCursorRay, cursorRay, fovTan);
+            if (m_EditingPolygonId != 0) SetPolygonPointEditing(false);
 
             // Custom meshes are not vanilla road-raycast targets. Pick them before endpoint
             // resolution, and use the same interaction in every mode that manages them.
@@ -213,7 +234,7 @@ namespace RoadGrass
                 // vanilla net raycast is over the junction gap or another
                 // road surface.
                 TryPickAnchor(
-                    manager.GetNodeAnchors(selectedFirst.Node),
+                    manager.GetNodeAnchors(selectedFirst.Node, Options.ActiveMode == MedianControllerMode.Connect, m_AnchorCandidates),
                     cursorRay,
                     fovTan,
                     out hovered);
@@ -231,15 +252,14 @@ namespace RoadGrass
                                 hit.m_Position,
                                 out overlayNode))
                         {
-                            candidates = manager.GetNodeAnchors(overlayNode);
+                            candidates = manager.GetNodeAnchors(overlayNode, Options.ActiveMode == MedianControllerMode.Connect, m_AnchorCandidates);
                         }
                         else
                         {
-                            candidates = manager.GetNodeAnchors(edgeData.m_Start);
+                            candidates = manager.GetNodeAnchors(edgeData.m_Start, Options.ActiveMode == MedianControllerMode.Connect, m_AnchorCandidates);
                             if (edgeData.m_End != edgeData.m_Start)
                             {
-                                candidates.AddRange(
-                                    manager.GetNodeAnchors(edgeData.m_End));
+                                manager.GetNodeAnchors(edgeData.m_End, Options.ActiveMode == MedianControllerMode.Connect, candidates, true);
                             }
                         }
                         TryPickAnchor(
@@ -262,7 +282,7 @@ namespace RoadGrass
                 {
                     overlayNode = node;
                     TryPickAnchor(
-                        manager.GetNodeAnchors(node),
+                        manager.GetNodeAnchors(node, Options.ActiveMode == MedianControllerMode.Connect, m_AnchorCandidates),
                         cursorRay,
                         fovTan,
                         out hovered);
@@ -345,6 +365,7 @@ namespace RoadGrass
                 if (Options.ActiveMode == MedianControllerMode.Edit)
                 {
                     manager.TryEditEndpoint(hovered, Options.EditCapChoice, Options.EditSurfaceChoice, Options.ExtendIntoIntersection);
+                    manager.SetLinkedCrosswalkGaps(hovered.Key, Options.CrosswalkGaps);
                 }
                 else if (Options.ActiveMode == MedianControllerMode.Reset)
                 {
@@ -353,7 +374,7 @@ namespace RoadGrass
                 else if (!m_FirstAnchor.HasValue)
                 {
                     if (automaticTarget != null &&
-                        manager.AddLink(hovered, automaticTarget))
+                        manager.AddLink(hovered, automaticTarget, Options.CrosswalkGaps))
                     {
                         m_FirstAnchor = null;
                         automaticTarget = null;
@@ -370,7 +391,7 @@ namespace RoadGrass
                 else if (manager.TryResolveAnchor(
                              m_FirstAnchor.Value,
                              out RoadGrassResolvedMedianAnchor first) &&
-                         manager.AddLink(first, hovered))
+                         manager.AddLink(first, hovered, Options.CrosswalkGaps))
                 {
                     m_FirstAnchor = null;
                 }
@@ -378,7 +399,7 @@ namespace RoadGrass
 
             bool junctionHasCandidates = manager != null &&
                 overlayNode != Entity.Null &&
-                manager.GetNodeAnchors(overlayNode).Count > 0;
+                manager.GetNodeAnchors(overlayNode, Options.ActiveMode == MedianControllerMode.Connect, m_AnchorCandidates).Count > 0;
             UpdateTooltipState(
                 manager,
                 hovered,
@@ -507,7 +528,7 @@ namespace RoadGrass
             for (int endpoint = 0; endpoint < 2; endpoint++)
             {
                 bool end = endpoint == 1;
-                if (!manager.TryGetSelectableAnchors(edge, end, out var anchors))
+                if (!manager.TryGetSelectableAnchors(edge, end, out var anchors, Options.ActiveMode == MedianControllerMode.Connect))
                 {
                     continue;
                 }
@@ -629,7 +650,7 @@ namespace RoadGrass
                 math.isfinite(fovTan) && fovTan > 0f;
         }
 
-        private static bool TryGetUniqueAutomaticTarget(
+        private bool TryGetUniqueAutomaticTarget(
             RoadGrassJoinCompositionSystem manager,
             RoadGrassResolvedMedianAnchor source,
             out RoadGrassResolvedMedianAnchor target)
@@ -642,7 +663,7 @@ namespace RoadGrass
             }
 
             List<RoadGrassResolvedMedianAnchor> candidates =
-                manager.GetNodeAnchors(source.Node);
+                manager.GetNodeAnchors(source.Node, source.Key.IsRoadsideGrass, m_AnchorCandidates);
             for (int i = 0; i < candidates.Count; i++)
             {
                 RoadGrassResolvedMedianAnchor candidate = candidates[i];
@@ -688,7 +709,7 @@ namespace RoadGrass
                 : (overlayNode != Entity.Null
                     ? overlayNode
                     : hovered?.Node ?? Entity.Null);
-            List<RoadGrassResolvedMedianAnchor> candidates = manager.GetNodeAnchors(node);
+            List<RoadGrassResolvedMedianAnchor> candidates = manager.GetNodeAnchors(node, Options.ActiveMode == MedianControllerMode.Connect, m_AnchorCandidates);
             var commands = new NativeList<OverlayCommand>(Allocator.TempJob);
 
             for (int i = 0; i < candidates.Count; i++)

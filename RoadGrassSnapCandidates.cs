@@ -6,9 +6,8 @@ namespace RoadGrass
 {
     internal static class RoadGrassSnapCandidates
     {
-        internal static IEnumerable<int2> Pairs(IReadOnlyList<Line3.Segment> lines)
+        internal static IEnumerable<int2> Pairs(IReadOnlyList<Line3.Segment> lines, float cellSize = 8)
         {
-            const float cellSize = 8;
             var cells = new Dictionary<int2, List<int>>();
             var lower = new int2[lines.Count];
             for (int i = 0; i < lines.Count; i++)

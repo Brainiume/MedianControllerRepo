@@ -12,6 +12,14 @@ namespace RoadGrass
             internal readonly List<bool> Opening = new();
         }
 
+        internal static bool IsBridge(Loop loop, int edge)
+        {
+            for (int i = 0; i < loop.Points.Count; i++)
+                if (i != edge && loop.Opening[i] && math.distancesq(loop.Points[edge], loop.Points[(i+1)%loop.Points.Count]) < 1e-7f &&
+                    math.distancesq(loop.Points[(edge+1)%loop.Points.Count], loop.Points[i]) < 1e-7f) return true;
+            return false;
+        }
+
         internal static void PinOpening(Loop loop, float3 left, float3 right, float width, float2 inset)
         {
             // A skewed junction stretches the cross-section; authored offsets remain
@@ -20,7 +28,7 @@ namespace RoadGrass
             float3 a = left + across * inset.x, b = right - across * inset.y;
             for (int i = 0; i < loop.Points.Count; i++)
             {
-                if (!loop.Opening[i]) continue;
+                if (!loop.Opening[i] || IsBridge(loop,i)) continue;
                 int next = (i + 1) % loop.Points.Count;
                 bool leftFirst = math.distancesq(loop.Points[i].xz, a.xz) < math.distancesq(loop.Points[next].xz, a.xz);
                 loop.Points[i] = leftFirst ? a : b;
@@ -39,6 +47,31 @@ namespace RoadGrass
             {
                 if (math.abs(Area(simple.Points)) < .0001f) continue;
                 var moved = Offset(simple, settings.x, settings.y);
+                // A short guide sample beside a sharp tip can be consumed by the inset.
+                // Drop only its shallow corner, not the entire otherwise drawable island.
+                while (simple.Points.Count > 3)
+                {
+                    int corner = -1;
+                    float smoothest = .9f;
+                    for (int i = 0; i < simple.Points.Count; i++)
+                    {
+                        int next = (i + 1) % simple.Points.Count;
+                        if (math.dot(moved.Points[next].xz - moved.Points[i].xz,
+                            simple.Points[next].xz - simple.Points[i].xz) >= 0) continue;
+                        for (int j = 0; j < 2; j++)
+                        {
+                            int k = j == 0 ? i : next, previous = (k + simple.Points.Count - 1) % simple.Points.Count;
+                            int after = (k + 1) % simple.Points.Count;
+                            if (simple.Opening[previous] != simple.Opening[k]) continue;
+                            float alignment = math.dot(math.normalizesafe(simple.Points[k].xz - simple.Points[previous].xz),
+                                math.normalizesafe(simple.Points[after].xz - simple.Points[k].xz));
+                            if (alignment > smoothest) { smoothest = alignment; corner = k; }
+                        }
+                    }
+                    if (corner < 0) break;
+                    simple.Points.RemoveAt(corner); simple.Opening.RemoveAt(corner);
+                    moved = Offset(simple, settings.x, settings.y);
+                }
                 var insetEdges = new List<float3>(moved.Points);
                 foreach (var part in Split(moved))
                 {
@@ -69,8 +102,6 @@ namespace RoadGrass
                     if (!collapsed)
                     {
                         var rounded = Round(part, settings.z, settings.w, 1);
-                        for (int scale = 2; rounded.Points.Count > 128 && scale <= 4; scale *= 2)
-                            rounded = Round(part, settings.z, settings.w, scale);
                         result.Add(rounded);
                     }
                 }

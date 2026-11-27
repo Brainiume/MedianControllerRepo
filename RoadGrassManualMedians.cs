@@ -23,8 +23,14 @@ namespace RoadGrass
             internal bool Attached;
             internal bool HasOpening;
             internal string ShapeMessage = "";
+            internal float NativeCurbWidth;
+            internal List<float3> ResolvedPoints;
+            internal int PointsEpoch = -1;
+            internal int RuntimeSections;
         }
         private readonly Dictionary<int, ManualMedian> m_ManualMedians = new();
+        private readonly HashSet<int> m_ManualOutlineIds = new();
+        internal IEnumerable<int> ManualMedianOutlineIds => m_ManualOutlineIds;
         private readonly Dictionary<RoadGrassMedianAnchorKey, int> m_ManualKeys = new();
         private bool m_ManualLoaded, m_ManualPreviewSet;
         private RoadGrassMedianAnchorKey m_ManualPreviewKey;
@@ -40,9 +46,12 @@ namespace RoadGrass
 
         private void ResetManualRuntime()
         {
-            RoadGrassPolygonPrototypeBatchSystem.Instance?.Clear();
+            ResetPolygonSurfaceOptions();
+            foreach (int id in m_ManualMedians.Keys) RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
             m_ManualMedians.Clear(); m_ManualKeys.Clear(); m_ManualLoaded = false;
-            m_PolygonRenderKeys.Clear();
+            m_ManualOutlineIds.Clear();
+            m_EditEdges.Clear(); m_EditPolygons.Clear();
+            m_PolygonRenderKeys.Clear(); m_PolygonSectionOrdinals.Clear();
             m_PolygonPreviewPoints = null;
             m_ManualPreviewSet = false; SelectedManualMedianId = 0; ManualMessage = "";
         }
@@ -211,13 +220,13 @@ namespace RoadGrass
             var vertices=EntityManager.GetBuffer<RoadGrassSavedManualMedianVertex>(city);
             foreach(var p in median.Points)vertices.Add(new RoadGrassSavedManualMedianVertex{Id=id,Offset=p});
             m_ManualMedians.Add(id,median);m_ManualKeys.Add(saved.Key,id);
-            SelectedManualMedianId=id;ManualMessage="";ClearTaperPlans(false);m_Dirty=true;return true;
+            SelectedManualMedianId=id;ManualMessage="";m_ManualPreviewSet=false;QueueMedianEdit(saved.Edge);return true;
         }
 
         internal bool SetManualSurface(int id, MedianSavedSurface surface)
         {
             if((uint)surface>2||!CanEditSelectedManualMedian||!m_ManualMedians.TryGetValue(id,out var median))return false;
-            if(median.Saved.Surface==surface)return true;
+            if(median.Saved.Surface==surface && median.Saved.TerrainLayer == PolygonTerrainLayer.None)return true;
             if (median.Points.Count >= 3)
             {
                 if (!EnsurePolygonPlan(median, out var source) || !BindPolygonSurface(source, median.Sections, surface, out var halves, out var error)) return false;
@@ -228,11 +237,12 @@ namespace RoadGrass
                 if (!TryResolveManual(median, out var anchor, out var destination)) return false;
                 if (!TryCreateGuidedMedian(anchor,destination,surface,out _,out var reason)) { ManualMessage=reason; return false; }
             }
-            var saved=median.Saved;saved.Surface=surface;median.Saved=saved;
+            var saved=median.Saved;saved.Surface=surface;saved.TerrainLayer=PolygonTerrainLayer.None;median.Saved=saved;
             var records=EntityManager.GetBuffer<RoadGrassSavedManualMedian>(m_CityQuery.GetSingletonEntity());
             for(int i=0;i<records.Length;i++)if(records[i].Id==id)records[i]=saved;
-            if (median.Points.Count < 3) ClearTaperPlans(false);
-            m_Dirty=true;ManualMessage=median.ShapeMessage;return true;
+            if (median.Points.Count < 3) m_TaperPlans.Remove(median.Saved.Key);
+            if (median.Points.Count >= 3) QueuePolygonEdit(id); else QueueMedianEdit(median.Saved.Edge);
+            ManualMessage=median.ShapeMessage;return true;
         }
         internal void RemoveManualMedian(int id)
         {
@@ -243,10 +253,17 @@ namespace RoadGrass
             var vertices=EntityManager.GetBuffer<RoadGrassSavedManualMedianVertex>(city);
             for(int i=vertices.Length-1;i>=0;i--)if(vertices[i].Id==id)vertices.RemoveAt(i);
             m_ManualMedians.Remove(id);
+            m_ManualOutlineIds.Remove(id);
+            for (int i = 0; i < median.RuntimeSections; i++)
+            {
+                var key = PolygonSectionKey(median.Saved.Edge, median.Saved.Anchor.End, id, i);
+                m_TaperPlans.Remove(key); m_PolygonRenderKeys.Remove(key);
+                m_RenderPairs.Remove(key); m_Resolved.Remove(key); m_RenderStates.Remove(key);
+            }
             RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
             if (median.Points.Count == 2) m_ManualKeys.Remove(median.Saved.Key);
             if(SelectedManualMedianId==id)SelectedManualMedianId=0;
-            m_TaperPlans.Remove(median.Saved.Key);m_Dirty=true;ManualMessage="";
+            m_TaperPlans.Remove(median.Saved.Key);QueueMedianEdit(median.Saved.Edge);ManualMessage="";
         }
         private bool TryResolveManual(ManualMedian median,out RoadGrassResolvedMedianAnchor anchor,out float3 destination)
         {
@@ -265,24 +282,32 @@ namespace RoadGrass
             if(!m_ManualMedians.TryGetValue(id,out var median)||!m_TaperPlans.TryGetValue(median.Saved.Key,out var plan)||plan.Half==null)return false;
             geometry=BuildEdgeGeometry(plan.Half.Geometry.m_Left.m_Left,plan.Half.Geometry.m_Right.m_Right);return true;
         }
-        private void SynchronizeManualMedians()
+        private bool IsParentRoadDeleted(Entity edge) =>
+            edge == Entity.Null || !EntityManager.Exists(edge) || EntityManager.HasComponent<Deleted>(edge);
+
+        private bool HasDeletedManualParent(ManualMedian median) =>
+            IsParentRoadDeleted(median.Saved.Edge) ||
+            (!RoadGrassSettings.AutomaticMedianDeletionDisabled && median.Points.Count < 3 &&
+             (!EntityManager.Exists(median.Saved.Node) || EntityManager.HasComponent<Deleted>(median.Saved.Node)));
+
+        private void SynchronizeManualMedians(HashSet<Entity> edges = null, HashSet<int> polygons = null)
         {
-            m_PolygonRenderKeys.Clear();
+            if (edges == null) m_PolygonRenderKeys.Clear();
             var deleted=new List<int>();
             foreach(var entry in m_ManualMedians)
-                if(!EntityManager.Exists(entry.Value.Saved.Edge)||!EntityManager.Exists(entry.Value.Saved.Node)||
-            EntityManager.HasComponent<Deleted>(entry.Value.Saved.Edge)||EntityManager.HasComponent<Deleted>(entry.Value.Saved.Node)||
-            (entry.Value.Points.Count >= 3 && !TryResolveSavedAnchor(entry.Value.Saved.Edge, entry.Value.Saved.Anchor, out _)))deleted.Add(entry.Key);
+                if (HasDeletedManualParent(entry.Value)) deleted.Add(entry.Key);
             foreach(int id in deleted)RemoveManualMedian(id);
-            if (deleted.Count > 0) ManualMessage = $"{deleted.Count} medians removed because their parent median was lost";
+            if (deleted.Count > 0) ManualMessage = $"{deleted.Count} medians removed because their parent road was deleted";
             foreach(var entry in m_ManualMedians)
             {
                 var median=entry.Value;
+                if (edges != null && !edges.Contains(median.Saved.Edge) && polygons?.Contains(entry.Key) != true) continue;
                 TrackTaperDependency(median.Saved.Edge);
                 TrackTaperDependency(median.Saved.Node);
                 if (median.Points.Count >= 3) { SynchronizePolygon(entry.Key, median); continue; }
+                m_ManualOutlineIds.Add(entry.Key);
                 if(!TryResolveManual(median,out var anchor,out var destination))
-                {ManualMessage="Saved contour unavailable: its source cannot be rebound safely";continue;}
+                {RetainProtectedVariant(median.Saved.Key);ManualMessage="Saved contour unavailable: its source cannot be rebound safely";continue;}
                 var key=anchor.Key;
                 RoadGrassTransitionMesh.Half half;
                 if(m_TaperPlans.TryGetValue(key,out var cached)&&cached.Manual&&cached.Destination.Equals(destination)&&cached.Half!=null)

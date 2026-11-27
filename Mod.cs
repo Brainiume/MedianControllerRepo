@@ -16,7 +16,6 @@ namespace RoadGrass
             .SetShowsErrorsInUI(false);
 
         private RoadGrassSettings m_Settings;
-        internal static Game.Input.ProxyAction CloseToolAction { get; private set; }
 
         public void OnLoad(UpdateSystem updateSystem)
         {
@@ -34,14 +33,13 @@ namespace RoadGrass
 
             GameManager.instance.localizationManager.AddSource("en-US", new LocaleEN(m_Settings));
             m_Settings.RegisterInOptionsUI();
-            m_Settings.RegisterKeyBindings();
-            CloseToolAction = m_Settings.GetAction(RoadGrassSettings.CloseTool);
-            if (CloseToolAction != null) CloseToolAction.shouldBeEnabled = false;
 
             updateSystem.UpdateAt<RoadGrassPrefabSystem>(SystemUpdatePhase.UIUpdate);
             updateSystem.UpdateAt<RoadGrassUISystem>(SystemUpdatePhase.UIUpdate);
             updateSystem.UpdateAt<RoadGrassJoinTooltipSystem>(SystemUpdatePhase.UITooltip);
             updateSystem.UpdateAt<RoadGrassJoinToolSystem>(SystemUpdatePhase.ToolUpdate);
+            updateSystem.UpdateAt<MedianIntersectionCaptureTool>(SystemUpdatePhase.ToolUpdate);
+            updateSystem.UpdateAt<MedianIntersectionCaptureTooltip>(SystemUpdatePhase.UITooltip);
 
             updateSystem.UpdateAfter<RoadGrassMeshInjectSystem, NetCompositionSystem>(SystemUpdatePhase.Modification4);
             updateSystem.UpdateAfter<RoadGrassClearDataSystem, NetCompositionSystem>(SystemUpdatePhase.Modification4);
@@ -83,10 +81,10 @@ namespace RoadGrass
 
         public void OnDispose()
         {
+            MedianIntersectionCaptureTool.Instance?.Deactivate();
             RoadGrassPolygonPrototypeBatchSystem.Instance?.Shutdown();
+            RoadGrassCustomTextures.Dispose();
             m_Settings?.UnregisterInOptionsUI();
-            if (CloseToolAction != null) CloseToolAction.shouldBeEnabled = false;
-            CloseToolAction = null;
             m_Settings = null;
             TryInfo(nameof(OnDispose));
         }

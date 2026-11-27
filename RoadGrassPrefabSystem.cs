@@ -1,4 +1,7 @@
 using Colossal;
+using System;
+using System.IO;
+using System.Reflection;
 using Colossal.Serialization.Entities;
 using Game;
 using Game.Prefabs;
@@ -47,6 +50,15 @@ namespace RoadGrass
             toolUI.name = PrefabName;
             toolUI.m_Group = grassUI.m_Group;
             toolUI.m_Icon = grassUI.m_Icon;
+            using (var icon = Assembly.GetExecutingAssembly().GetManifestResourceStream("RoadGrass.ToolIcon.svg"))
+            {
+                if (icon != null)
+                {
+                    using var data = new MemoryStream();
+                    icon.CopyTo(data);
+                    toolUI.m_Icon = "data:image/svg+xml;base64," + Convert.ToBase64String(data.ToArray());
+                }
+            }
             toolUI.m_Priority = grassUI.m_Priority + 1;
             toolUI.m_IsDebugObject = grassUI.m_IsDebugObject;
             toolUI.active = grassUI.active;

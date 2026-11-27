@@ -52,6 +52,9 @@ namespace RoadGrass
         internal Entity RepresentativePiece;
         internal float NormalizedCenter;
         internal float Width;
+        internal bool IsValid => !float.IsNaN(NormalizedCenter) && !float.IsInfinity(NormalizedCenter) &&
+            !float.IsNaN(Width) && !float.IsInfinity(Width) && Width > .01f &&
+            (Ordinal >= 0 || Ordinal <= int.MinValue / 2);
 
         internal RoadGrassMedianAnchorData(
             bool end,
@@ -163,39 +166,45 @@ namespace RoadGrass
         internal RoadGrassMedianAnchorData AnchorA;
         internal Entity EdgeB;
         internal RoadGrassMedianAnchorData AnchorB;
+        internal bool CrosswalkGaps;
 
         internal RoadGrassSavedMedianPair(
             ulong pairId,
             Entity edgeA,
             RoadGrassMedianAnchorData anchorA,
             Entity edgeB,
-            RoadGrassMedianAnchorData anchorB)
+            RoadGrassMedianAnchorData anchorB,
+            bool crosswalkGaps = false)
         {
             PairId = pairId;
             EdgeA = edgeA;
             AnchorA = anchorA;
             EdgeB = edgeB;
             AnchorB = anchorB;
+            CrosswalkGaps = crosswalkGaps;
         }
 
         public void Serialize<TWriter>(TWriter writer) where TWriter : IWriter
         {
-            writer.Write(1);
+            writer.Write(CrosswalkGaps ? 2 : 1);
             writer.Write(PairId);
             writer.Write(EdgeA);
             AnchorA.Serialize(writer);
             writer.Write(EdgeB);
             AnchorB.Serialize(writer);
+            if (CrosswalkGaps) writer.Write(CrosswalkGaps);
         }
 
         public void Deserialize<TReader>(TReader reader) where TReader : IReader
         {
-            reader.Read(out int _);
+            reader.Read(out int version);
             reader.Read(out PairId);
             reader.Read(out EdgeA);
             AnchorA.Deserialize(reader);
             reader.Read(out EdgeB);
             AnchorB.Deserialize(reader);
+            CrosswalkGaps = false;
+            if (version >= 2) reader.Read(out CrosswalkGaps);
         }
     }
 }

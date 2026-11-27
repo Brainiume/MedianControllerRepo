@@ -24,8 +24,13 @@ namespace RoadGrass
         {
             internal object Plan;
             internal MedianSavedSurface Surface;
+            internal PolygonTerrainLayer TerrainLayer;
+            internal float TextureTiling;
+            internal List<RoadGrassTaperGeometry.Lane> Crosswalks;
+            internal int TerrainDiffuseId, TerrainNormalId;
             internal Mesh Pavement, Grass;
             internal Material PavementMaterial, GrassMaterial;
+            internal List<RenderTexture> FillTextures;
             internal List<Colossal.IO.AssetDatabase.TextureAsset> MaterialTextures;
             internal Entity MeshEntity, Carrier;
             internal int Group = -1;
@@ -37,6 +42,9 @@ namespace RoadGrass
             internal Vector3[] PickVertices;
             internal int[] PickTriangles;
             internal List<Line3.Segment> Outline;
+            internal RoadGrassMedianPickIndex PickIndex;
+            internal Vector2[] InteriorUVs;
+            internal float OriginalTiling;
         }
 
         internal struct Write
@@ -58,6 +66,9 @@ namespace RoadGrass
         private readonly Dictionary<int, Entry> m_Pending = new();
         private readonly HashSet<int> m_Remove = new();
         private NativeList<Write> m_Writes;
+        private RoadGrassMedianPickIndex m_PickIndex;
+        private int[] m_PickIds = Array.Empty<int>();
+        internal int WriteRevision { get; private set; }
         internal NativeArray<Write> Writes => m_Writes.AsArray();
 
         protected override void OnCreate()
@@ -82,11 +93,25 @@ namespace RoadGrass
             return m_Resources != null;
         }
 
-        internal bool Matches(int id, object plan, MedianSavedSurface surface, out bool accepted, out string reason)
+        internal bool Matches(int id, object plan, MedianSavedSurface surface, out bool accepted, out string reason,
+            PolygonTerrainLayer terrainLayer = PolygonTerrainLayer.None, float textureTiling = 1, List<RoadGrassTaperGeometry.Lane> crosswalks = null)
         {
             accepted = false; reason = "";
             if (!m_Pending.TryGetValue(id, out var entry)) m_Entries.TryGetValue(id, out entry);
-            if (entry == null || !ReferenceEquals(entry.Plan, plan) || entry.Surface != surface) return false;
+            if (entry == null || !ReferenceEquals(entry.Plan, plan) || entry.Surface != surface || entry.TerrainLayer != terrainLayer || entry.TextureTiling != textureTiling) return false;
+            if ((entry.Crosswalks == null) != (crosswalks == null)) return false;
+            if (crosswalks != null)
+            {
+                if (entry.Crosswalks.Count != crosswalks.Count) return false;
+                for (int i = 0; i < crosswalks.Count; i++)
+                    if (!entry.Crosswalks[i].Curve.Equals(crosswalks[i].Curve) || entry.Crosswalks[i].Width != crosswalks[i].Width) return false;
+            }
+            if (terrainLayer != PolygonTerrainLayer.None)
+            {
+                RoadGrassTerrainTextures.TryGet(terrainLayer, out var diffuse, out var normal);
+                if (entry.TerrainDiffuseId != (diffuse != null ? diffuse.GetInstanceID() : 0) ||
+                    entry.TerrainNormalId != (normal != null ? normal.GetInstanceID() : 0)) return false;
+            }
             accepted = entry.Error == null;
             reason = entry.Error;
             return true;
@@ -94,6 +119,19 @@ namespace RoadGrass
 
         internal bool IsReady(int id) => !m_Remove.Contains(id) && !m_Pending.ContainsKey(id) &&
             m_Entries.TryGetValue(id, out var entry) && entry.Group >= 0 && entry.Error == null;
+        internal void SurfaceMaterialsReady()
+        {
+            foreach (var entry in m_Entries.Values) if (entry.TerrainLayer != PolygonTerrainLayer.None) entry.TerrainDiffuseId = -1;
+            foreach (var entry in m_Pending.Values) if (entry.TerrainLayer != PolygonTerrainLayer.None) entry.TerrainDiffuseId = -1;
+            RoadGrassJoinCompositionSystem.Instance?.SurfaceMaterialsReady();
+        }
+
+        internal bool TryTerrainMaterial(Material template, PolygonTerrainLayer layer, bool legacy, out Material material) =>
+            m_Resources.TryTerrainMaterial(template, layer, legacy, out material);
+        internal void CopyMedianMaterials(EntityManager manager, PrefabSystem prefabs, RoadGrassResolvedMedianAnchor source,
+            RoadGrassResolvedMedianAnchor curbSource, RoadGrassPolygonPrototypeMesh.Profile profile, bool useGrass,
+            out Material pavement, out Material grass, out List<Colossal.IO.AssetDatabase.TextureAsset> textures, out List<RenderTexture> fillTextures) =>
+            m_Resources.CopyMedianMaterials(manager, prefabs, source, curbSource, profile, useGrass, out pavement, out grass, out textures, out fillTextures);
 
         private Entry GetPickEntry(int id)
         {
@@ -111,37 +149,73 @@ namespace RoadGrass
             hit = float.MaxValue;
             var entry = GetPickEntry(id);
             if (entry == null) return false;
-            float3 a = ray.a - entry.Origin, b = ray.b - entry.Origin;
-            var local = new Line3.Segment(a, b);
-            float3 delta = b - a, low = entry.Bounds.min - entry.Origin, high = entry.Bounds.max - entry.Origin;
-            float near = 0, far = 1;
-            for (int axis = 0; axis < 3; axis++)
+            if (!RoadGrassMedianPickIndex.Hit(entry.Bounds, ray, 1, out _)) return false;
+            var local = new Line3.Segment(ray.a - entry.Origin, ray.b - entry.Origin);
+            bool found = false;
+            hit = entry.PickIndex.Query(local, (triangle, best) =>
             {
-                if (math.abs(delta[axis]) < .000001f)
-                { if (a[axis] < low[axis] || a[axis] > high[axis]) return false; }
-                else
-                {
-                    float first = (low[axis] - a[axis]) / delta[axis], last = (high[axis] - a[axis]) / delta[axis];
-                    near = math.max(near, math.min(first, last)); far = math.min(far, math.max(first, last));
-                    if (near > far) return false;
-                }
-            }
-            for (int i = 0; i < entry.PickTriangles.Length; i += 3)
-                if (RoadGrassPolygonSections.RayTriangle(local, entry.PickVertices[entry.PickTriangles[i]],
-                    entry.PickVertices[entry.PickTriangles[i + 1]], entry.PickVertices[entry.PickTriangles[i + 2]], out float score))
-                    hit = math.min(hit, score);
+                int i = triangle * 3;
+                if (!RoadGrassPolygonSections.RayTriangle(local, entry.PickVertices[entry.PickTriangles[i]],
+                    entry.PickVertices[entry.PickTriangles[i + 1]], entry.PickVertices[entry.PickTriangles[i + 2]], out float score) || score > best) return best;
+                found = true; return score;
+            });
+            if (!found) hit = float.MaxValue;
             return hit < float.MaxValue;
         }
 
+        internal int PickClosest(Line3.Segment ray, out float distance)
+        {
+            int id = 0;
+            distance = m_PickIndex?.Query(ray, (item, best) =>
+            {
+                int candidate = m_PickIds[item];
+                if (TryPick(candidate, ray, out float hit) && hit <= best) { id = candidate; return hit; }
+                return best;
+            }) ?? float.MaxValue;
+            if (id == 0) distance = float.MaxValue;
+            return id;
+        }
+
+        internal bool TryRetile(int id, float tiling)
+        {
+            if (m_Pending.ContainsKey(id) || !m_Entries.TryGetValue(id, out var entry) || entry.Error != null ||
+                entry.Grass == null || entry.InteriorUVs == null || entry.OriginalTiling <= 0) return false;
+            float ratio = tiling / entry.OriginalTiling;
+            bool native = (entry.GrassMaterial ?? m_Resources.Grass).shader.name == "BH/NetCompositionMeshLitShader";
+            float minimum = 0;
+            if (native) foreach (int index in entry.Grass.triangles) minimum = math.min(minimum, entry.InteriorUVs[index].y * ratio);
+            float shift = native ? math.ceil(-minimum) : 0;
+            var uv = new List<Vector4>(entry.InteriorUVs.Length);
+            foreach (var point in entry.InteriorUVs) uv.Add(new Vector4(point.x * ratio, point.y * ratio + shift, native ? .5f : 0, 0));
+            entry.Grass.SetUVs(0, uv); entry.TextureTiling = tiling;
+            return true;
+        }
+
         internal void Submit(int id, object plan, MedianSavedSurface surface, Mesh mesh, float3 origin, bool grass, List<Line3.Segment> outline,
-            Material pavementMaterial, Material grassMaterial, List<Colossal.IO.AssetDatabase.TextureAsset> materialTextures)
+            Material pavementMaterial, Material grassMaterial, List<Colossal.IO.AssetDatabase.TextureAsset> materialTextures,
+            List<RenderTexture> fillTextures, PolygonTerrainLayer terrainLayer = PolygonTerrainLayer.None, float textureTiling = 1, List<RoadGrassTaperGeometry.Lane> crosswalks = null,
+            (Vector3[] Vertices, int[] Triangles, Bounds Bounds)? selection = null)
         {
             if (m_Pending.TryGetValue(id, out var old)) DestroyMeshes(old);
-            var bounds = mesh.bounds;
-            m_Pending[id] = new Entry { Plan = plan, Surface = surface, Pavement = mesh, Origin = origin,
+            var bounds = selection?.Bounds ?? mesh.bounds;
+            RoadGrassTerrainTextures.TryGet(terrainLayer, out var terrainDiffuse, out var terrainNormal);
+            var entry = new Entry { Plan = plan, Surface = surface, TerrainLayer = terrainLayer, TextureTiling = textureTiling, Crosswalks = crosswalks, Pavement = mesh, Origin = origin,
+                TerrainDiffuseId = terrainDiffuse != null ? terrainDiffuse.GetInstanceID() : 0,
+                TerrainNormalId = terrainNormal != null ? terrainNormal.GetInstanceID() : 0,
                 Bounds = new Bounds3((float3)bounds.min + origin, (float3)bounds.max + origin), UseGrass = grass,
-                PickVertices = mesh.vertices, PickTriangles = mesh.triangles, Outline = outline,
-                PavementMaterial = pavementMaterial, GrassMaterial = grassMaterial, MaterialTextures = materialTextures };
+                PickVertices = id > 0 ? selection?.Vertices ?? mesh.vertices : Array.Empty<Vector3>(),
+                PickTriangles = id > 0 ? selection?.Triangles ?? mesh.triangles : Array.Empty<int>(), Outline = outline,
+                PavementMaterial = pavementMaterial, GrassMaterial = grassMaterial, MaterialTextures = materialTextures, FillTextures = fillTextures };
+            var triangleBounds = new Bounds3[entry.PickTriangles.Length / 3];
+            for (int i = 0; i < triangleBounds.Length; i++)
+            {
+                float3 a = entry.PickVertices[entry.PickTriangles[i * 3]], b = entry.PickVertices[entry.PickTriangles[i * 3 + 1]], c = entry.PickVertices[entry.PickTriangles[i * 3 + 2]];
+                // Match RayTriangle's edge tolerance at shared triangle boundaries.
+                float3 padding = (math.abs(b - a) + math.abs(c - a)) * .0002f + .00001f;
+                triangleBounds[i] = new Bounds3(math.min(a, math.min(b, c)) - padding, math.max(a, math.max(b, c)) + padding);
+            }
+            entry.PickIndex = new RoadGrassMedianPickIndex(triangleBounds);
+            m_Pending[id] = entry;
             m_Remove.Remove(id);
         }
 
@@ -163,6 +237,7 @@ namespace RoadGrass
         {
             Clear();
             if (m_Entries.Count != 0) OnUpdate();
+            FinishCleanup();
         }
 
         protected override void OnGamePreload(Purpose purpose, GameMode mode)
@@ -173,6 +248,8 @@ namespace RoadGrass
 
         protected override void OnUpdate()
         {
+            RoadGrassTerrainTextures.PumpCompletions();
+            if (m_BatchManager.CheckPropertyUpdates()) WriteRevision++;
             if (!RoadGrassSettings.VerboseLoggingEnabled) m_ReportPending = false;
             if (m_Pending.Count == 0 && m_Remove.Count == 0 && !m_ReportPending) return;
             // Structural changes are bounded to commit/edit/remove/load events, never hover or ordinary simulation.
@@ -219,6 +296,11 @@ namespace RoadGrass
                 RoadGrassJoinCompositionSystem.Instance?.PolygonPrototypeChanged(request.Key, entry.Error);
             }
             m_Pending.Clear();
+            var ids = new List<int>(); var bounds = new List<Bounds3>();
+            foreach (var pair in m_Entries)
+                if (pair.Key > 0 && pair.Value.Error == null) { ids.Add(pair.Key); bounds.Add(pair.Value.Bounds); }
+            m_PickIds = ids.ToArray(); m_PickIndex = new RoadGrassMedianPickIndex(bounds.ToArray());
+            WriteRevision++;
             m_Writes.Clear();
             foreach (var entry in m_Entries.Values)
                 if (entry.Group >= 0 && entry.Error == null)
@@ -234,11 +316,13 @@ namespace RoadGrass
             NativeSubBatches<CullingData, GroupData, BatchData, InstanceData> subBatches)
         {
             if (m_Resources == null) throw new InvalidOperationException("Polygon shader is unavailable");
+            // A crosswalk can cover the whole polygon; retain its saved shape and picking without an empty draw batch.
+            if (entry.Pavement.GetIndexCount(0) == 0 && entry.Pavement.GetIndexCount(1) == 0) return;
             // CustomBatch draws submesh zero. Split resources instead of touching internal setters.
-            if (entry.UseGrass && entry.Pavement.GetIndexCount(1) > 0)
+            if (entry.Pavement.GetIndexCount(1) > 0)
             {
                 entry.Grass = UnityEngine.Object.Instantiate(entry.Pavement);
-                entry.Grass.name = "Median Controller polygon grass mesh";
+                entry.Grass.name = "Median Controller polygon interior mesh";
                 var triangles = entry.Grass.GetTriangles(1);
                 entry.Grass.subMeshCount = 1;
                 entry.Grass.SetTriangles(triangles, 0);
@@ -249,7 +333,10 @@ namespace RoadGrass
             var localBounds = new Bounds3(entry.Bounds.min - entry.Origin, entry.Bounds.max - entry.Origin);
             EncodeComposition(entry.Pavement, entry.PavementMaterial ?? m_Resources.Pavement, localBounds);
             if (entry.Grass != null)
-                EncodeComposition(entry.Grass, entry.GrassMaterial ?? m_Resources.Grass, localBounds);
+            {
+                entry.InteriorUVs = entry.Grass.uv; entry.OriginalTiling = entry.TextureTiling;
+                EncodeComposition(entry.Grass, entry.GrassMaterial ?? (entry.UseGrass ? m_Resources.Grass : m_Resources.Pavement), localBounds);
+            }
             // No PrefabRef or serializable mod component: these entities are excluded from saved city state.
             entry.MeshEntity = EntityManager.CreateEntity(ComponentType.ReadWrite<NetCompositionMeshData>());
             EntityManager.SetComponentData(entry.MeshEntity, new NetCompositionMeshData { m_State = MeshFlags.Default });
@@ -261,7 +348,7 @@ namespace RoadGrass
             for (int i = 0; i < GroupData.MAX_PROPERTY_COUNT; i++) data.SetPropertyIndex(i, -1);
             entry.Group = groups.CreateGroup(data, 2, instances, subBatches);
             Add(entry.Pavement, entry.PavementMaterial ?? m_Resources.Pavement);
-            if (entry.Grass != null) Add(entry.Grass, entry.GrassMaterial ?? m_Resources.Grass);
+            if (entry.Grass != null) Add(entry.Grass, entry.GrassMaterial ?? (entry.UseGrass ? m_Resources.Grass : m_Resources.Pavement));
             // Every batch and its property layout must exist before creating the instance.
             int instance = instances.AddInstance(new InstanceData { m_Entity = entry.Carrier, m_MeshGroup = byte.MaxValue },
                 // m_LodCount is the highest LOD index, so one LOD uses index/range zero.
@@ -272,6 +359,7 @@ namespace RoadGrass
 
             void Add(Mesh mesh, Material material)
             {
+                if (mesh.GetIndexCount(0) == 0) return;
                 World.GetOrCreateSystemManaged<RenderingSystem>().SetShaderEnabled(material.shader, true);
                 int batchIndex = groups.CreateBatch(new BatchData { m_LodMesh = entry.MeshEntity,
                     m_VTIndex0 = -1, m_VTIndex1 = -1, m_RenderFlags = data.m_RenderFlags,
@@ -305,9 +393,11 @@ namespace RoadGrass
 
         private static void DestroyMeshes(Entry entry)
         {
-            if (entry.PavementMaterial != null) UnityEngine.Object.Destroy(entry.PavementMaterial);
-            if (entry.GrassMaterial != null) UnityEngine.Object.Destroy(entry.GrassMaterial);
+            RoadGrassPolygonPrototypeResources.ReleaseMaterial(entry.PavementMaterial);
+            RoadGrassPolygonPrototypeResources.ReleaseMaterial(entry.GrassMaterial);
             entry.PavementMaterial = entry.GrassMaterial = null;
+            if (entry.FillTextures != null) foreach (var tile in entry.FillTextures) UnityEngine.Object.Destroy(tile);
+            entry.FillTextures = null;
             if (entry.MaterialTextures != null)
                 foreach (var texture in entry.MaterialTextures) texture.Unload();
             entry.MaterialTextures = null;
@@ -366,6 +456,7 @@ namespace RoadGrass
     internal partial class RoadGrassPolygonPrototypeDataSystem : GameSystemBase
     {
         private BatchManagerSystem m_BatchManager;
+        private int m_LastWriteRevision = -1, m_WritePasses;
         protected override void OnCreate() { base.OnCreate(); m_BatchManager = World.GetOrCreateSystemManaged<BatchManagerSystem>(); }
 
         [BurstCompile]
@@ -430,6 +521,9 @@ namespace RoadGrass
             var system = RoadGrassPolygonPrototypeBatchSystem.Instance;
             if (system == null) return;
             system.FinishCleanup();
+            if (m_LastWriteRevision != system.WriteRevision)
+            { m_LastWriteRevision = system.WriteRevision; m_WritePasses = 2; }
+            if (m_WritePasses == 0) return;
             if (system.Writes.Length == 0) return;
             var groups = m_BatchManager.GetNativeBatchGroups(true, out var groupDeps);
             var instances = m_BatchManager.GetNativeBatchInstances(false, out var instanceDeps);
@@ -437,6 +531,7 @@ namespace RoadGrass
                 system.Writes.Length, 32, JobHandle.CombineDependencies(Dependency, groupDeps, instanceDeps));
             m_BatchManager.AddNativeBatchGroupsReader(Dependency);
             m_BatchManager.AddNativeBatchInstancesWriter(Dependency);
+            m_WritePasses--;
         }
 
         protected override void OnDestroy() { Dependency.Complete(); base.OnDestroy(); }

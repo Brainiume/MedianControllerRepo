@@ -8,8 +8,11 @@ using Game.Common;
 using Game.Net;
 using Game.Prefabs;
 using Game.Rendering;
+using Unity.Burst;
+using Unity.Burst.Intrinsics;
 using Unity.Collections;
 using Unity.Entities;
+using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine.Scripting;
 
@@ -52,15 +55,22 @@ namespace RoadGrass
             internal readonly RoadGrassMedianAnchorKey Paired;
             internal readonly BatchDataHelpers.CompositionParameters Parameters;
             internal readonly Bounds3 Bounds;
+            internal readonly List<MedianRenderState> Spans;
+            internal readonly EdgeGeometry? ConnectionGeometry;
+            internal readonly List<RoadGrassTaperGeometry.Lane> Crosswalks;
 
             internal MedianRenderState(
                 RoadGrassMedianAnchorKey paired,
                 BatchDataHelpers.CompositionParameters parameters,
-                Bounds3 bounds)
+                Bounds3 bounds, List<MedianRenderState> spans = null, EdgeGeometry? connectionGeometry = null,
+                List<RoadGrassTaperGeometry.Lane> crosswalks = null)
             {
                 Paired = paired;
                 Parameters = parameters;
                 Bounds = bounds;
+                Spans = spans;
+                ConnectionGeometry = connectionGeometry;
+                Crosswalks = crosswalks;
             }
         }
 
@@ -102,19 +112,26 @@ namespace RoadGrass
         private readonly HashSet<ulong> m_PendingPairIds = new();
         private readonly HashSet<RoadGrassMedianAnchorKey> m_RetainedPairAnchors = new();
         private readonly Dictionary<EndpointCacheKey, List<RoadGrassResolvedMedianAnchor>> m_ResolveCache = new();
+        private readonly Dictionary<EndpointCacheKey, (Composition Composition, Entity Node, Entity Prefab)> m_EmptyResolveSources = new();
         private readonly List<RoadGrassMedianAnchorKey> m_RemoveKeys = new();
         private readonly List<RoadGrassMedianAnchorKey> m_PendingFinalize = new();
         private ulong m_NextPairId = 1;
+        private readonly HashSet<ulong> m_CrosswalkGapPairs = new();
         private const int LoadSettleQuietFrames = 3;
         private const int LoadSettleMinimumFrames = 30;
         private const int LoadSettleMaximumFrames = 240;
         private bool m_SuspendedForSave;
+        private readonly List<Entity> m_SaveExcludedCarriers = new();
         private bool m_GameReady;
         private bool m_PersistenceInitialized;
         private bool m_WaitingForLoadSettle;
         private bool m_BatchHydrationPending;
-        private BatchHydrationReason m_BatchHydrationReason;
         private bool m_Dirty = true;
+        private readonly HashSet<Entity> m_EditEdges = new();
+        private readonly HashSet<int> m_EditPolygons = new();
+
+        private void QueueMedianEdit(Entity edge) => m_EditEdges.Add(edge);
+        private void QueuePolygonEdit(int id) => m_EditPolygons.Add(id);
         private int m_LastPendingPairCount = -1;
         private int m_RenderRevision = 1;
         private int m_LoadSettleQuietFrames;
@@ -124,27 +141,22 @@ namespace RoadGrass
         internal static RoadGrassJoinCompositionSystem Instance { get; private set; }
         internal int RenderRevision => m_RenderRevision;
 
-        private enum BatchHydrationReason
-        {
-            None,
-            CityLoad,
-            SaveReapply
-        }
-
         private readonly struct EndpointCacheKey : IEquatable<EndpointCacheKey>
         {
             internal readonly Entity Edge;
             internal readonly bool End;
+            internal readonly bool IncludeRoadsideGrass;
 
-            internal EndpointCacheKey(Entity edge, bool end)
+            internal EndpointCacheKey(Entity edge, bool end, bool includeRoadsideGrass = false)
             {
                 Edge = edge;
                 End = end;
+                IncludeRoadsideGrass = includeRoadsideGrass;
             }
 
-            public bool Equals(EndpointCacheKey other) => Edge == other.Edge && End == other.End;
+            public bool Equals(EndpointCacheKey other) => Edge == other.Edge && End == other.End && IncludeRoadsideGrass == other.IncludeRoadsideGrass;
             public override bool Equals(object obj) => obj is EndpointCacheKey other && Equals(other);
-            public override int GetHashCode() => (Edge.GetHashCode() * 397) ^ End.GetHashCode();
+            public override int GetHashCode() => (Edge.GetHashCode() * 397) ^ End.GetHashCode() ^ (IncludeRoadsideGrass ? 7919 : 0);
         }
 
         [Preserve]
@@ -171,7 +183,10 @@ namespace RoadGrass
         protected override void OnGamePreload(Purpose purpose, GameMode mode)
         {
             base.OnGamePreload(purpose, mode);
+            m_CrosswalkGapPairs.Clear();
             m_PersistenceInitialized = false;
+            m_CrosswalkCaps.Clear();
+            m_TerrainMedianFills.Clear();
             RestoreAllEndpointMeshes();
             m_Styles.Clear();
             m_StyledEdges.Clear();
@@ -179,13 +194,12 @@ namespace RoadGrass
             ResetManualRuntime();
             m_SegmentSurfaces.Clear();
             m_SegmentSurfacesLoaded = false;
-            m_PendingSegmentSurfaces = false;
             m_LastPendingPairCount = -1;
             m_SuspendedForSave = false;
+            m_SaveExcludedCarriers.Clear();
             m_GameReady = false;
             m_WaitingForLoadSettle = false;
             m_BatchHydrationPending = false;
-            m_BatchHydrationReason = BatchHydrationReason.None;
             m_Dirty = true;
             m_LoadSettleQuietFrames = 0;
             m_LoadSettleStartFrame = 0;
@@ -209,7 +223,7 @@ namespace RoadGrass
             m_LastPendingPairCount = -1;
             m_GameReady = true;
             m_WaitingForLoadSettle = true;
-            RequestBatchHydration(BatchHydrationReason.CityLoad);
+            m_BatchHydrationPending = true;
             m_Dirty = true;
             m_LoadSettleQuietFrames = 0;
             m_LoadSettleStartFrame = UnityEngine.Time.frameCount;
@@ -219,7 +233,9 @@ namespace RoadGrass
         [Preserve]
         protected override void OnUpdate()
         {
-            if (m_SuspendedForSave || !m_GameReady)
+            // Also restore exclusion tags if serialization aborted before its reapply system ran.
+            if (m_SuspendedForSave) ResumeAfterSerialization();
+            if (!m_GameReady)
             {
                 return;
             }
@@ -234,16 +250,36 @@ namespace RoadGrass
                 return;
             }
 
-            // Pending pairs wait for a network update; polling them rebuilt the
-            // entire city's median plans every frame while geometry was missing.
-            if (!m_Dirty &&
-                (!m_PendingSegmentSurfaces || UnityEngine.Time.frameCount % 30 != 0))
+            // Missing resources wait for load, user edits or network/texture changes; never poll/rebuild on a timer.
+            if (!m_Dirty)
             {
+                if (m_EditEdges.Count == 0 && m_EditPolygons.Count == 0) return;
+                var edges = new HashSet<Entity>(m_EditEdges);
+                foreach (var pair in m_ActivePairs)
+                    if (m_EditEdges.Contains(pair.Key.Edge) || m_EditEdges.Contains(pair.Value.Edge))
+                    { edges.Add(pair.Key.Edge); edges.Add(pair.Value.Edge); }
+                if (m_EditEdges.Count != 0)
+                {
+                    SynchronizeSegmentMeshes(edges);
+                    SynchronizeRenderStates(edges);
+                    SynchronizeIntersectionTapers(edges);
+                }
+                foreach (int id in m_EditPolygons)
+                    if (m_ManualMedians.TryGetValue(id, out var median)) edges.Add(median.Saved.Edge);
+                SynchronizeManualMedians(edges, m_EditPolygons);
+                SynchronizeVariants(edges);
+                SynchronizeEndpointMeshes(edges);
+                if (m_EditEdges.Count != 0) SynchronizeTerrainMedianFills(edges);
+                m_EditEdges.Clear(); m_EditPolygons.Clear();
+                BeginPendingBatchHydration();
                 return;
             }
             m_Dirty = false;
+            m_EditEdges.Clear(); m_EditPolygons.Clear();
 
             m_ResolveCache.Clear();
+            m_EmptyResolveSources.Clear();
+            m_InvalidMedianEdges.Clear();
             HydrateEndpointStyles();
             HydrateManualMedians();
             HydrateSegmentSurfaces();
@@ -256,17 +292,26 @@ namespace RoadGrass
             SynchronizeManualMedians();
             SynchronizeVariants();
             SynchronizeEndpointMeshes();
+            SynchronizeTerrainMedianFills();
             BeginPendingBatchHydration();
         }
 
         internal bool TryGetSelectableAnchors(
             Entity edge,
             bool end,
-            out List<RoadGrassResolvedMedianAnchor> anchors)
+            out List<RoadGrassResolvedMedianAnchor> anchors,
+            bool includeRoadsideGrass = false)
         {
-            var key = new EndpointCacheKey(edge, end);
+            var key = new EndpointCacheKey(edge, end, includeRoadsideGrass);
             if (m_ResolveCache.TryGetValue(key, out anchors))
             {
+                if (anchors.Count == 0 && m_EmptyResolveSources.TryGetValue(key, out var empty) &&
+                    !EntityManager.HasComponent<Updated>(edge) && !EntityManager.HasComponent<Created>(edge) &&
+                    !EntityManager.HasComponent<Deleted>(edge) && EntityManager.TryGetComponent(edge, out Composition composition) &&
+                    composition.m_Edge == empty.Composition.m_Edge && composition.m_StartNode == empty.Composition.m_StartNode &&
+                    composition.m_EndNode == empty.Composition.m_EndNode && EntityManager.TryGetComponent(edge, out Edge road) &&
+                    (end ? road.m_End : road.m_Start) == empty.Node && EntityManager.TryGetComponent(edge, out PrefabRef prefab) && prefab.m_Prefab == empty.Prefab)
+                    return false;
                 if (anchors.Count > 0 && EntityManager.Exists(edge) &&
                     !EntityManager.HasComponent<Deleted>(edge) &&
                     EntityManager.TryGetComponent(edge, out Composition current) &&
@@ -285,8 +330,15 @@ namespace RoadGrass
                 GetBufferLookup<NetSectionPiece>(true),
                 GetComponentLookup<NetPieceData>(true),
                 GetComponentLookup<NetVertexMatchData>(true),
-                out anchors);
+                out anchors, out bool invalidData, includeRoadsideGrass: includeRoadsideGrass,
+                prefabs: includeRoadsideGrass ? World.GetExistingSystemManaged<PrefabSystem>() : null);
+            if (invalidData && !EntityManager.HasComponent<Updated>(edge)) m_InvalidMedianEdges.Add(edge);
             m_ResolveCache[key] = anchors;
+            if (anchors.Count == 0 && EntityManager.TryGetComponent(edge, out Composition emptyComposition) &&
+                EntityManager.HasComponent<NetCompositionData>(emptyComposition.m_Edge) && EntityManager.HasBuffer<NetCompositionPiece>(emptyComposition.m_Edge) &&
+                EntityManager.TryGetComponent(edge, out Edge emptyRoad) && EntityManager.TryGetComponent(edge, out PrefabRef emptyPrefab))
+                m_EmptyResolveSources[key] = (emptyComposition, end ? emptyRoad.m_End : emptyRoad.m_Start, emptyPrefab.m_Prefab);
+            else m_EmptyResolveSources.Remove(key);
             return result;
         }
 
@@ -295,7 +347,7 @@ namespace RoadGrass
             out RoadGrassResolvedMedianAnchor anchor)
         {
             anchor = null;
-            if (!TryGetSelectableAnchors(key.Edge, key.End, out var anchors))
+            if (!TryGetSelectableAnchors(key.Edge, key.End, out var anchors, key.IsRoadsideGrass))
             {
                 return false;
             }
@@ -311,9 +363,11 @@ namespace RoadGrass
             return false;
         }
 
-        internal List<RoadGrassResolvedMedianAnchor> GetNodeAnchors(Entity node)
+        internal List<RoadGrassResolvedMedianAnchor> GetNodeAnchors(Entity node, bool includeRoadsideGrass = false,
+            List<RoadGrassResolvedMedianAnchor> result = null, bool append = false)
         {
-            var result = new List<RoadGrassResolvedMedianAnchor>();
+            result ??= new List<RoadGrassResolvedMedianAnchor>();
+            if (!append) result.Clear();
             if (node == Entity.Null || !EntityManager.Exists(node) ||
                 !EntityManager.HasBuffer<ConnectedEdge>(node))
             {
@@ -329,7 +383,7 @@ namespace RoadGrass
                     continue;
                 }
                 bool end = edge.m_End == node;
-                if (TryGetSelectableAnchors(edgeEntity, end, out var anchors))
+                if (TryGetSelectableAnchors(edgeEntity, end, out var anchors, includeRoadsideGrass))
                 {
                     result.AddRange(anchors);
                 }
@@ -358,7 +412,7 @@ namespace RoadGrass
 
         internal bool AddLink(
             RoadGrassResolvedMedianAnchor a,
-            RoadGrassResolvedMedianAnchor b)
+            RoadGrassResolvedMedianAnchor b, bool crosswalkGaps = false)
         {
             if (a == null || b == null || a.Node == Entity.Null || a.Node != b.Node ||
                 a.Key.Edge == b.Key.Edge ||
@@ -382,9 +436,12 @@ namespace RoadGrass
                     a.Key.Edge,
                     a.Data,
                     b.Key.Edge,
-                    b.Data));
+                    b.Data, crosswalkGaps));
             CachePairGeometry(a, b, aGeometry, bGeometry);
-            m_Dirty = true;
+            m_ActivePairs[a.Key] = b.Key; m_ActivePairs[b.Key] = a.Key;
+            m_Resolved[a.Key] = a; m_Resolved[b.Key] = b;
+            m_LastResolvedPairs[pairId] = (a, b);
+            QueueMedianEdit(a.Key.Edge); QueueMedianEdit(b.Key.Edge);
             Mod.TryInfo(
                 $"Linked pair {pairId} selected vanilla median pieces " +
                 $"{a.Key} ({a.Width:F2}m) and " +
@@ -400,14 +457,15 @@ namespace RoadGrass
         {
             aGeometry = default;
             bGeometry = default;
-            if (a == null || b == null || RoadGrassTransitionMesh.IsBlockedWidthPair(a.Width, b.Width)) return false;
+            if (a == null || b == null || a.Key.IsRoadsideGrass != b.Key.IsRoadsideGrass ||
+                (!a.Key.IsRoadsideGrass && RoadGrassTransitionMesh.IsBlockedWidthPair(a.Width, b.Width))) return false;
             return TryBuildPairGeometry(a, b, out aGeometry, out bGeometry);
         }
 
         internal void RemoveAnchorLinks(RoadGrassMedianAnchorKey key)
         {
-            ClearTaperPlans(false);
-            m_Dirty = true;
+            m_TaperPlans.Remove(key);
+            QueueMedianEdit(key.Edge);
             if (!EntityManager.Exists(key.Edge) ||
                 !EntityManager.HasBuffer<RoadGrassMedianPieceLink>(key.Edge))
             {
@@ -540,17 +598,21 @@ namespace RoadGrass
             m_PersistenceInitialized = true;
             m_WaitingForLoadSettle = false;
             m_BatchHydrationPending = false;
-            m_BatchHydrationReason = BatchHydrationReason.None;
             m_LastPendingPairCount = 0;
             m_NextPairId = 1;
+            m_CrosswalkGapPairs.Clear();
+            RoadGrassPolygonPrototypeBatchSystem.Instance?.Clear();
+            m_CrosswalkCaps.Clear();
+            m_TerrainMedianFills.Clear();
             m_Dirty = false;
         }
 
         internal void SyncMedianBatches(RoadGrassJoinMedianBatchSystem batchSystem)
         {
+            PruneCrosswalkCaps();
             if (m_SuspendedForSave)
             {
-                batchSystem.RemoveAll();
+                return;
             }
             else
             {
@@ -570,7 +632,7 @@ namespace RoadGrass
             RoadGrassMedianAnchorKey key,
             RoadGrassMedianAnchorKey pairedKey,
             out BatchDataHelpers.CompositionParameters parameters,
-            out Bounds3 bounds)
+            out Bounds3 bounds, int span = 0)
         {
             parameters = default;
             bounds = default;
@@ -580,10 +642,18 @@ namespace RoadGrass
                 return false;
             }
 
+            if (state.Spans != null)
+            {
+                if ((uint)span >= state.Spans.Count) return false;
+                state = state.Spans[span];
+            }
             parameters = state.Parameters;
             bounds = state.Bounds;
             return true;
         }
+
+        internal int GetMedianRenderSpanCount(RoadGrassMedianAnchorKey key) =>
+            m_RenderStates.TryGetValue(key, out var state) ? state.Spans?.Count ?? 1 : 0;
 
         internal void FinalizePendingVariants()
         {
@@ -624,33 +694,24 @@ namespace RoadGrass
                 return;
             }
             CapturePersistentPairs();
-            RestoreAllEndpointMeshes();
             m_SuspendedForSave = true;
-            RoadGrassJoinMedianBatchSystem.Instance?.RemoveAll();
-            DestroyAllVariants();
+            // SerializerSystem already excludes compositions; Temp excludes only our render carriers for this save.
+            foreach (var state in m_Variants.Values)
+            {
+                if (!EntityManager.Exists(state.Carrier) || EntityManager.HasComponent<Game.Tools.Temp>(state.Carrier)) continue;
+                EntityManager.AddComponent<Game.Tools.Temp>(state.Carrier);
+                m_SaveExcludedCarriers.Add(state.Carrier);
+            }
         }
 
         internal void ResumeAfterSerialization()
         {
+            if (!m_SuspendedForSave) return;
+            foreach (Entity carrier in m_SaveExcludedCarriers)
+                if (EntityManager.Exists(carrier) && EntityManager.HasComponent<Game.Tools.Temp>(carrier))
+                    EntityManager.RemoveComponent<Game.Tools.Temp>(carrier);
+            m_SaveExcludedCarriers.Clear();
             m_SuspendedForSave = false;
-            m_WaitingForLoadSettle = false;
-            // The save hook destroyed the runtime median compositions so they
-            // could not enter the city save. Their replacement mesh refs and
-            // batch groups are new even though the city itself stayed loaded.
-            // Treat post-save reapplication like renderer hydration: do not
-            // expose a native instance until the regenerated mesh/group has
-            // remained available and the batch-data pass can deform it in the
-            // same Rendering phase. This is especially important for autosave,
-            // which runs after Rendering and otherwise leaves default-transform
-            // median fragments visible on the following frames.
-            RequestBatchHydration(BatchHydrationReason.SaveReapply);
-            m_Dirty = true;
-        }
-
-        private void RequestBatchHydration(BatchHydrationReason reason)
-        {
-            m_BatchHydrationPending = true;
-            m_BatchHydrationReason = reason;
         }
 
         private void BeginPendingBatchHydration()
@@ -667,7 +728,6 @@ namespace RoadGrass
                 if (m_LastPendingPairCount == 0)
                 {
                     m_BatchHydrationPending = false;
-                    m_BatchHydrationReason = BatchHydrationReason.None;
                 }
                 return;
             }
@@ -680,15 +740,9 @@ namespace RoadGrass
                 return;
             }
 
-            BatchHydrationReason reason = m_BatchHydrationReason;
             batchSystem.BeginHydrationDelay();
             m_BatchHydrationPending = false;
-            m_BatchHydrationReason = BatchHydrationReason.None;
-            Mod.TryInfo(
-                $"Preparing {m_Variants.Count} joined-median endpoint render instance(s) after " +
-                (reason == BatchHydrationReason.SaveReapply
-                    ? "save reapply"
-                    : "city load"));
+            Mod.TryInfo($"Preparing {m_Variants.Count} joined-median endpoint render instance(s) after city load");
         }
 
         private bool AdvanceLoadSettleGate()
@@ -870,24 +924,24 @@ namespace RoadGrass
                     m_NextPairId = pair.PairId + 1;
                 }
                 savedPairs.Add(pair);
+                if (pair.CrosswalkGaps) m_CrosswalkGapPairs.Add(pair.PairId);
             }
 
             for (int i = 0; i < savedPairs.Count; i++)
             {
                 RoadGrassSavedMedianPair pair = savedPairs[i];
-                if (pair.EdgeA == Entity.Null || pair.EdgeB == Entity.Null)
+                if (pair.EdgeA == Entity.Null || pair.EdgeB == Entity.Null || pair.EdgeA == pair.EdgeB ||
+                    !pair.AnchorA.IsValid || !pair.AnchorB.IsValid)
                 {
-                    RemovePersistentPair(pair.PairId);
+                    RemovePairById(pair.PairId);
                     continue;
                 }
 
                 bool aExists = EntityManager.Exists(pair.EdgeA);
                 bool bExists = EntityManager.Exists(pair.EdgeB);
-                if ((aExists && EntityManager.HasComponent<Deleted>(pair.EdgeA)) ||
-                    (bExists && EntityManager.HasComponent<Deleted>(pair.EdgeB)))
+                if (IsParentRoadDeleted(pair.EdgeA) || IsParentRoadDeleted(pair.EdgeB))
                 {
-                    RemovePersistentPair(pair.PairId);
-                    RemovePairMirrors(pair.PairId);
+                    RemovePairById(pair.PairId);
                     Mod.TryInfo(
                         $"Removed persistent median pair {pair.PairId} because a road was deleted");
                     continue;
@@ -976,6 +1030,7 @@ namespace RoadGrass
                 return;
             }
             UpsertPersistentPair(pairs, pair);
+            if (pair.CrosswalkGaps) m_CrosswalkGapPairs.Add(pair.PairId);
         }
 
         private static void UpsertPersistentPair(
@@ -986,6 +1041,7 @@ namespace RoadGrass
             {
                 if (pairs[i].PairId == pair.PairId)
                 {
+                    pair.CrosswalkGaps |= pairs[i].CrosswalkGaps;
                     pairs[i] = pair;
                     return;
                 }
@@ -995,6 +1051,7 @@ namespace RoadGrass
 
         private void RemovePersistentPair(ulong pairId)
         {
+            m_CrosswalkGapPairs.Remove(pairId);
             m_LastResolvedPairs.Remove(pairId);
             m_PendingPairIds.Remove(pairId);
             if (pairId == 0 ||
@@ -1109,10 +1166,20 @@ namespace RoadGrass
                     // though its road curves did not change. Retry on this event.
                     m_Dirty = true;
                 }
+                else
+                {
+                    if (m_CrosswalkGapPairs.Count > 0) RefreshCrosswalkClearance(edge);
+                    foreach (var median in m_ManualMedians.Values)
+                        if (median.Saved.CrosswalkGaps && (median.Saved.Edge == edge ||
+                            (EntityManager.TryGetComponent(edge, out Edge road) &&
+                             (road.m_Start == median.Saved.Node || road.m_End == median.Saved.Node))))
+                        { m_Dirty = true; break; }
+                }
             }
 
             for (int i = 0; i < invalid.Count; i++)
             {
+                if (RoadGrassSettings.AutomaticMedianDeletionDisabled && !IsParentRoadDeleted(invalid[i])) continue;
                 Entity edge = invalid[i];
                 Mod.TryInfo(
                     $"Removing median joins from {edge}: source road changed or was deleted");
@@ -1121,11 +1188,12 @@ namespace RoadGrass
             }
         }
 
-        private void SynchronizeRenderStates()
+        private void SynchronizeRenderStates(HashSet<Entity> edges = null)
         {
             m_RemoveKeys.Clear();
             foreach (KeyValuePair<RoadGrassMedianAnchorKey, MedianRenderState> entry in m_RenderStates)
             {
+                if (edges != null && !edges.Contains(entry.Key.Edge)) continue;
                 if (!m_ActivePairs.TryGetValue(entry.Key, out RoadGrassMedianAnchorKey paired) ||
                     !entry.Value.Paired.Equals(paired))
                 {
@@ -1139,6 +1207,7 @@ namespace RoadGrass
 
             foreach (KeyValuePair<RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey> pair in m_ActivePairs)
             {
+                if (edges != null && !edges.Contains(pair.Key.Edge)) continue;
                 if (m_RetainedPairAnchors.Contains(pair.Key)) continue;
                 if (m_RenderStates.TryGetValue(pair.Key, out MedianRenderState existing) &&
                     existing.Paired.Equals(pair.Value) &&
@@ -1146,6 +1215,9 @@ namespace RoadGrass
                     m_Resolved.TryGetValue(pair.Value, out var existingB) &&
                     math.abs(existingA.Width - existingB.Width) <= 0.01f)
                 {
+                    if (existing.ConnectionGeometry.HasValue && m_RenderStates.TryGetValue(pair.Value, out var opposite) &&
+                        opposite.ConnectionGeometry.HasValue)
+                        CachePairGeometry(existingA, existingB, existing.ConnectionGeometry.Value, opposite.ConnectionGeometry.Value);
                     continue;
                 }
                 if (!m_Resolved.TryGetValue(pair.Key, out RoadGrassResolvedMedianAnchor a) ||
@@ -1166,9 +1238,11 @@ namespace RoadGrass
             EdgeGeometry bGeometry)
         {
             BatchDataHelpers.CompositionParameters aParameters, bParameters;
+            RoadGrassTransitionMesh.Half aHalf = null, bHalf = null;
             if (math.abs(a.Width - b.Width) > 0.01f)
             {
                 if (!TryPlanTransition(a, b, aGeometry, bGeometry, out var transition)) return false;
+                aHalf = transition.A; bHalf = transition.B;
                 BatchDataHelpers.CalculateNodeParameters(transition.A.Geometry, transition.A.Composition, out aParameters);
                 BatchDataHelpers.CalculateNodeParameters(transition.B.Geometry, transition.B.Composition, out bParameters);
             }
@@ -1177,21 +1251,29 @@ namespace RoadGrass
                 BatchDataHelpers.CalculateEdgeParameters(aGeometry, isRotated: false, out aParameters);
                 BatchDataHelpers.CalculateEdgeParameters(bGeometry, isRotated: false, out bParameters);
             }
-            if (m_RenderStates.TryGetValue(a.Key, out var oldA) && oldA.Paired.Equals(b.Key) &&
+            var crosswalks = HasCrosswalkGaps(a.Key) ? GetConnectionCrosswalks(a.Node) : new List<RoadGrassTaperGeometry.Lane>();
+            bool sameGeometry = m_RenderStates.TryGetValue(a.Key, out var oldA) && oldA.Paired.Equals(b.Key) &&
                 m_RenderStates.TryGetValue(b.Key, out var oldB) && oldB.Paired.Equals(a.Key) &&
                 oldA.Parameters.Equals(aParameters) && oldB.Parameters.Equals(bParameters) &&
-                oldA.Bounds.Equals(aGeometry.m_Bounds) && oldB.Bounds.Equals(bGeometry.m_Bounds)) return true;
+                oldA.Bounds.Equals(aGeometry.m_Bounds) && oldB.Bounds.Equals(bGeometry.m_Bounds);
+            if (sameGeometry && CrosswalksEqual(oldA.Crosswalks, crosswalks)) return true;
+            RemoveCrosswalkCaps(a.Key);
+            RemoveCrosswalkCaps(b.Key);
+            var aSpans = CrosswalkRenderSpans(a, b.Key, aGeometry, crosswalks, aHalf);
+            var bSpans = CrosswalkRenderSpans(b, a.Key, bGeometry, crosswalks, bHalf);
+            bool changed = !sameGeometry || !RenderSpansEqual(oldA.Spans, aSpans) ||
+                !RenderSpansEqual(m_RenderStates[b.Key].Spans, bSpans);
             m_RenderStates[a.Key] = new MedianRenderState(
                 b.Key,
                 aParameters,
-                aGeometry.m_Bounds);
+                aGeometry.m_Bounds, aSpans, aGeometry, crosswalks);
             m_RenderStates[b.Key] = new MedianRenderState(
                 a.Key,
                 bParameters,
-                bGeometry.m_Bounds);
+                bGeometry.m_Bounds, bSpans, bGeometry, crosswalks);
             CaptureEdgeStamp(a.Key.Edge);
             CaptureEdgeStamp(b.Key.Edge);
-            AdvanceRenderRevision();
+            if (changed) AdvanceRenderRevision();
             return true;
         }
 
@@ -1208,37 +1290,24 @@ namespace RoadGrass
             stamp = default;
             if (edge == Entity.Null || !EntityManager.Exists(edge) ||
                 EntityManager.HasComponent<Deleted>(edge) ||
-                !EntityManager.TryGetComponent(edge, out Edge edgeData) ||
-                !EntityManager.TryGetComponent(edge, out EdgeGeometry geometry))
+                !EntityManager.TryGetComponent(edge, out Edge edgeData))
             {
                 return false;
             }
-            stamp = new EdgeRuntimeStamp(
-                edgeData.m_Start,
-                edgeData.m_End,
-                CalculateGeometryStamp(geometry));
+            uint hash;
+            if (EntityManager.TryGetComponent(edge, out Game.Net.Curve curve))
+            {
+                // Signal/crosswalk updates rebuild derived junction geometry and lanes.
+                // Only the road's authored curve/prefab identifies a physical road edit.
+                hash = 2166136261u;
+                AccumulateStamp(ref hash, curve.m_Bezier.a); AccumulateStamp(ref hash, curve.m_Bezier.b);
+                AccumulateStamp(ref hash, curve.m_Bezier.c); AccumulateStamp(ref hash, curve.m_Bezier.d);
+            }
+            else return false; // Missing authored geometry is temporary unavailability, not a road edit.
+            if (EntityManager.TryGetComponent(edge, out PrefabRef prefab))
+                hash = (hash ^ (uint)prefab.m_Prefab.GetHashCode()) * 16777619u;
+            stamp = new EdgeRuntimeStamp(edgeData.m_Start, edgeData.m_End, hash);
             return true;
-        }
-
-        private static uint CalculateGeometryStamp(EdgeGeometry geometry)
-        {
-            uint hash = 2166136261u;
-            AccumulateSegmentStamp(ref hash, geometry.m_Start);
-            AccumulateSegmentStamp(ref hash, geometry.m_End);
-            return hash;
-        }
-
-        private static void AccumulateSegmentStamp(ref uint hash, Segment segment)
-        {
-            AccumulateStamp(ref hash, segment.m_Left.a);
-            AccumulateStamp(ref hash, segment.m_Left.b);
-            AccumulateStamp(ref hash, segment.m_Left.c);
-            AccumulateStamp(ref hash, segment.m_Left.d);
-            AccumulateStamp(ref hash, segment.m_Right.a);
-            AccumulateStamp(ref hash, segment.m_Right.b);
-            AccumulateStamp(ref hash, segment.m_Right.c);
-            AccumulateStamp(ref hash, segment.m_Right.d);
-            AccumulateStamp(ref hash, segment.m_Length);
         }
 
         private static void AccumulateStamp(ref uint hash, float3 value)
@@ -1260,12 +1329,16 @@ namespace RoadGrass
             hash = (hash ^ (uint)millimetres.y) * 16777619u;
         }
 
+        private readonly HashSet<Entity> m_InvalidMedianEdges = new();
+
         private void CollectActivePairs()
         {
             m_ActivePairs.Clear();
             m_Resolved.Clear();
             m_PendingPairIds.Clear();
             m_RetainedPairAnchors.Clear();
+            if (RoadGrassSettings.AutomaticMedianDeletionDisabled)
+                foreach (var pairId in m_LastResolvedPairs.Keys) RetainPendingPair(pairId);
             if (m_AllLinkedEdgesQuery.IsEmptyIgnoreFilter)
             {
                 ReportPendingPersistentPairs();
@@ -1273,6 +1346,7 @@ namespace RoadGrass
             }
 
             SeedPairIdAllocator();
+            var invalidPairs = new HashSet<ulong>();
             // Composition may be absent during a rebuild; its absence must not
             // exclude durable links before their cached geometry can be retained.
             using NativeArray<Entity> edges = m_AllLinkedEdgesQuery.ToEntityArray(Allocator.Temp);
@@ -1285,8 +1359,8 @@ namespace RoadGrass
                     continue;
                 }
 
-                DynamicBuffer<RoadGrassMedianPieceLink> links =
-                    EntityManager.GetBuffer<RoadGrassMedianPieceLink>(edge);
+                // Counterpart restoration can add buffers; never keep a live ECS buffer across it.
+                using var links = EntityManager.GetBuffer<RoadGrassMedianPieceLink>(edge).ToNativeArray(Allocator.Temp);
                 for (int j = links.Length - 1; j >= 0; j--)
                 {
                     RoadGrassMedianPieceLink link = links[j];
@@ -1297,8 +1371,11 @@ namespace RoadGrass
                         {
                             link.PairId = AllocatePairId();
                         }
-                        links[j] = link;
+                        AddLinkEntry(edge, link);
                     }
+                    if (link.PairedEdge == Entity.Null || link.PairedEdge == edge || !link.Local.IsValid || !link.Paired.IsValid ||
+                        IsParentRoadDeleted(edge) || IsParentRoadDeleted(link.PairedEdge))
+                    { invalidPairs.Add(link.PairId); continue; }
                     if (!TryResolveSavedAnchor(edge, link.Local, out var local) ||
                         !TryResolveSavedAnchor(link.PairedEdge, link.Paired, out var paired))
                     {
@@ -1306,7 +1383,9 @@ namespace RoadGrass
                         // become available several updates after save entities
                         // have deserialized.  Keep the durable pair and its
                         // mirrors intact so it can be rematched later.
-                        RetainPendingPair(link.PairId);
+                        if (m_InvalidMedianEdges.Contains(edge) || m_InvalidMedianEdges.Contains(link.PairedEdge))
+                            invalidPairs.Add(link.PairId);
+                        else RetainPendingPair(link.PairId);
                         continue;
                     }
 
@@ -1323,10 +1402,9 @@ namespace RoadGrass
                             Entity bNode = link.Paired.End ? bEdge.m_End : bEdge.m_Start;
                             disconnected |= aNode != Entity.Null && bNode != Entity.Null && aNode != bNode;
                         }
-                        if (!disconnected) { RetainPendingPair(link.PairId); continue; }
-                        RemovePersistentPair(link.PairId);
-                        RemoveCounterpart(edge, link);
-                        links.RemoveAt(j);
+                        if (!disconnected || RoadGrassSettings.AutomaticMedianDeletionDisabled)
+                        { RetainPendingPair(link.PairId); continue; }
+                        invalidPairs.Add(link.PairId);
                         Mod.TryWarn(
                             $"Removed saved median pair {link.PairId}: its roads no longer share the saved junction");
                         continue;
@@ -1359,7 +1437,7 @@ namespace RoadGrass
                     }
                     link.Local = local.Data;
                     link.Paired = paired.Data;
-                    links[j] = link;
+                    AddLinkEntry(edge, link);
                     if (!hasCachedGeometry && !CachePairGeometry(
                             local, paired, localGeometry, pairedGeometry))
                     {
@@ -1382,12 +1460,14 @@ namespace RoadGrass
                             paired.Data));
                 }
 
-                if (links.Length == 0)
+                if (EntityManager.HasBuffer<RoadGrassMedianPieceLink>(edge) &&
+                    EntityManager.GetBuffer<RoadGrassMedianPieceLink>(edge).Length == 0)
                 {
                     EntityManager.RemoveComponent<RoadGrassMedianPieceLink>(edge);
                 }
             }
 
+            foreach (ulong pairId in invalidPairs) RemovePairById(pairId);
             PruneTransitionPlans();
             ReportPendingPersistentPairs();
         }
@@ -1409,6 +1489,9 @@ namespace RoadGrass
             bool CanRetain(RoadGrassResolvedMedianAnchor anchor, RoadGrassMedianAnchorKey paired)
             {
                 Entity edge = anchor.Key.Edge;
+                if (IsParentRoadDeleted(edge)) return false;
+                if (RoadGrassSettings.AutomaticMedianDeletionDisabled)
+                    return m_RenderStates.TryGetValue(anchor.Key, out var retained) && retained.Paired.Equals(paired);
                 if (!EntityManager.Exists(edge) || EntityManager.HasComponent<Deleted>(edge) ||
                     !EntityManager.TryGetComponent(edge, out Edge road) ||
                     (anchor.Key.End ? road.m_End : road.m_Start) != anchor.Node ||
@@ -1426,15 +1509,16 @@ namespace RoadGrass
             out RoadGrassResolvedMedianAnchor anchor)
         {
             anchor = null;
-            return TryGetSelectableAnchors(edge, saved.End, out var anchors) &&
+            return TryGetSelectableAnchors(edge, saved.End, out var anchors, saved.Ordinal <= int.MinValue / 2) &&
                 RoadGrassMedianAnchorResolver.TryMatch(anchors, saved, out anchor);
         }
 
-        private void SynchronizeVariants()
+        private void SynchronizeVariants(HashSet<Entity> edges = null)
         {
             m_RemoveKeys.Clear();
             foreach (RoadGrassMedianAnchorKey key in m_Variants.Keys)
             {
+                if (edges != null && !edges.Contains(key.Edge)) continue;
                 if (!m_RenderPairs.ContainsKey(key) || !m_Resolved.ContainsKey(key) || !m_RenderStates.ContainsKey(key))
                 {
                     m_RemoveKeys.Add(key);
@@ -1449,6 +1533,7 @@ namespace RoadGrass
 
             foreach (KeyValuePair<RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey> pair in m_RenderPairs)
             {
+                if (edges != null && !edges.Contains(pair.Key.Edge)) continue;
                 // Preserve the styled mesh too while its source composition is rebuilding.
                 if (m_RetainedPairAnchors.Contains(pair.Key) &&
                     m_Variants.TryGetValue(pair.Key, out var retained) &&
@@ -1719,6 +1804,7 @@ namespace RoadGrass
 
         private void RemoveVariant(RoadGrassMedianAnchorKey key, bool removeBatch)
         {
+            RemoveCrosswalkCaps(key);
             if (removeBatch)
             {
                 RoadGrassJoinMedianBatchSystem.Instance?.RemoveAnchor(key);
@@ -1734,6 +1820,7 @@ namespace RoadGrass
             }
             m_Variants.Remove(key);
             m_ActivePairs.Remove(key);
+            m_RetainedPairAnchors.Remove(key);
             m_RenderPairs.Remove(key);
             m_Resolved.Remove(key);
             m_RenderStates.Remove(key);
@@ -1776,10 +1863,13 @@ namespace RoadGrass
                 return;
             }
 
-            m_Dirty = true;
+            bool known = m_LastResolvedPairs.TryGetValue(pairId, out var previous);
             RemovePersistentPair(pairId);
             var keys = new HashSet<RoadGrassMedianAnchorKey>();
-            using NativeArray<Entity> edges = m_AllLinkedEdgesQuery.ToEntityArray(Allocator.Temp);
+            using NativeArray<Entity> edges = known
+                ? new NativeArray<Entity>(new[] { previous.A.Key.Edge, previous.B.Key.Edge }, Allocator.Temp)
+                : m_AllLinkedEdgesQuery.ToEntityArray(Allocator.Temp);
+            if (!known) m_Dirty = true; // Unresolved/corrupt mirrors still require a complete reconciliation.
             for (int i = 0; i < edges.Length; i++)
             {
                 Entity edge = edges[i];
@@ -1816,6 +1906,7 @@ namespace RoadGrass
             RoadGrassJoinMedianBatchSystem.Instance?.RemoveAnchors(keys);
             foreach (RoadGrassMedianAnchorKey key in keys)
             {
+                QueueMedianEdit(key.Edge);
                 RemoveVariant(key, removeBatch: false);
             }
             foreach (RoadGrassMedianAnchorKey key in keys)
@@ -1834,6 +1925,7 @@ namespace RoadGrass
             RoadGrassMedianAnchorKey localKey,
             RoadGrassMedianPieceLink link)
         {
+            QueueMedianEdit(localEdge); QueueMedianEdit(link.PairedEdge);
             RemoveCounterpart(localEdge, link);
             if (EntityManager.Exists(localEdge) &&
                 EntityManager.HasBuffer<RoadGrassMedianPieceLink>(localEdge))
@@ -2051,13 +2143,7 @@ namespace RoadGrass
                 return false;
             }
 
-            // Fit the longitudinal path once with vanilla NetUtils.FitCurve,
-            // then carry the two native cross-sections through the same
-            // control net. Independent boundary fits give each curb different
-            // handle lengths and produce a shoulder/bulge when widths differ.
-            // Reusing the start half-width for control B and the end half-width
-            // for control C is a cubic smoothstep taper: width change is zero
-            // where the join meets either existing median.
+            // Share one native center path; rotate its width with the local tangent.
             Bezier4x3 centerApproach = MathUtils.Lerp(
                 aApproach.m_Left,
                 aApproach.m_Right,
@@ -2069,19 +2155,6 @@ namespace RoadGrass
             Bezier4x3 fullCenter = FitConnectionCurve(
                 centerApproach,
                 centerTarget);
-            BuildSmoothWidthBoundaries(
-                fullCenter,
-                (aApproach.m_Right.d - aApproach.m_Left.d) * 0.5f,
-                (bTarget.m_Right.a - bTarget.m_Left.a) * 0.5f,
-                out Bezier4x3 fullLeft,
-                out Bezier4x3 fullRight);
-            fullLeft = LiftCurve(fullLeft, ConnectionRenderLift);
-            fullRight = LiftCurve(fullRight, ConnectionRenderLift);
-            if (!ValidateBoundaryPair(fullLeft, fullRight))
-            {
-                return false;
-            }
-
             // Use one transverse division for both materials. Separate left
             // and right division positions create a diagonal width step even
             // when the two halves otherwise share their boundary curves.
@@ -2090,26 +2163,24 @@ namespace RoadGrass
                 0.2f,
                 0.8f);
 
-            MathUtils.Divide(
-                fullLeft,
-                out Bezier4x3 aLeft,
-                out Bezier4x3 bLeft,
-                seam);
-            MathUtils.Divide(
-                fullRight,
-                out Bezier4x3 aRight,
-                out Bezier4x3 bRight,
-                seam);
+            float3 startWidth = (aApproach.m_Right.d - aApproach.m_Left.d) * .5f;
+            float3 endWidth = (bTarget.m_Right.a - bTarget.m_Left.a) * .5f;
+            RoadGrassTransitionMesh.BuildPairBoundaries(fullCenter, startWidth, endWidth, ref seam,
+                out var aLeft, out var aRight, out var bLeft, out var bRight);
+            aLeft = LiftCurve(aLeft, ConnectionRenderLift); aRight = LiftCurve(aRight, ConnectionRenderLift);
+            bLeft = LiftCurve(bLeft, ConnectionRenderLift); bRight = LiftCurve(bRight, ConnectionRenderLift);
+            if (!ValidateBoundaryPair(aLeft, aRight) || !ValidateBoundaryPair(bLeft, bRight)) return false;
             aGeometry = BuildEdgeGeometry(aLeft, aRight);
             bGeometry = BuildEdgeGeometry(
                 MathUtils.Invert(bRight),
                 MathUtils.Invert(bLeft));
-            if (math.abs(a.Width - b.Width) > 0.01f && RoadGrassSettings.AppliedStretchFactor != 1f)
+            float stretchFactor = RoadGrassSettings.GetStretchFactor(a.Width, b.Width);
+            if (math.abs(a.Width - b.Width) > 0.01f && stretchFactor != 1f)
             {
                 if (a.Width < b.Width)
-                    aGeometry = RoadGrassTransitionMesh.ScaleSeam(aGeometry, RoadGrassSettings.AppliedStretchFactor);
+                    aGeometry = RoadGrassTransitionMesh.ScaleSeam(aGeometry, stretchFactor);
                 else
-                    bGeometry = RoadGrassTransitionMesh.ScaleSeam(bGeometry, RoadGrassSettings.AppliedStretchFactor);
+                    bGeometry = RoadGrassTransitionMesh.ScaleSeam(bGeometry, stretchFactor);
             }
             return ValidateEdgeGeometry(aGeometry) && ValidateEdgeGeometry(bGeometry) &&
                 (math.abs(a.Width - b.Width) <= 0.01f || TryPlanTransition(a, b, aGeometry, bGeometry, out _));
@@ -2140,29 +2211,6 @@ namespace RoadGrass
                 startDirection,
                 endDirection,
                 target.a);
-        }
-
-        private static void BuildSmoothWidthBoundaries(
-            Bezier4x3 center,
-            float3 startHalfWidth,
-            float3 endHalfWidth,
-            out Bezier4x3 left,
-            out Bezier4x3 right)
-        {
-            left = new Bezier4x3
-            {
-                a = center.a - startHalfWidth,
-                b = center.b - startHalfWidth,
-                c = center.c - endHalfWidth,
-                d = center.d - endHalfWidth
-            };
-            right = new Bezier4x3
-            {
-                a = center.a + startHalfWidth,
-                b = center.b + startHalfWidth,
-                c = center.c + endHalfWidth,
-                d = center.d + endHalfWidth
-            };
         }
 
         private static Bezier4x3 LiftCurve(Bezier4x3 curve, float height)
@@ -2347,10 +2395,32 @@ namespace RoadGrass
         private EntityQuery m_ChangedLinkedEdgesQuery;
         private EntityQuery m_ChangedStyledEdgesQuery;
         private EntityQuery m_ChangedTaperGeometryQuery;
+        private NativeParallelHashMap<Entity, byte> m_TrackedParents;
+        private int m_TrackedRevision = -1;
+        [BurstCompile]
+        private struct GatherChangedParentsJob : IJobChunk
+        {
+            [ReadOnly] internal EntityTypeHandle Entities;
+            [ReadOnly] internal ComponentLookup<Owner> Owners;
+            [ReadOnly] internal NativeParallelHashMap<Entity, byte> Tracked;
+            internal NativeParallelHashMap<Entity, byte>.ParallelWriter Changed;
+            public void Execute(in ArchetypeChunk chunk, int index, bool enabledMask, in v128 mask)
+            {
+                var entities = chunk.GetNativeArray(Entities);
+                foreach (var entity in entities)
+                {
+                    Entity parent = entity;
+                    if (!Tracked.ContainsKey(parent) && Owners.HasComponent(entity)) parent = Owners[entity].m_Owner;
+                    if (Tracked.ContainsKey(parent)) Changed.TryAdd(parent, 0);
+                }
+            }
+        }
 
         protected override void OnCreate()
         {
             base.OnCreate();
+            m_TrackedParents = new NativeParallelHashMap<Entity, byte>(1, Allocator.Persistent);
+            _ = GetComponentLookup<Owner>(true);
             m_ChangedLinkedEdgesQuery = GetEntityQuery(new EntityQueryDesc
             {
                 All = new[]
@@ -2370,9 +2440,9 @@ namespace RoadGrass
             });
             var events = new[] { ComponentType.ReadOnly<Updated>(), ComponentType.ReadOnly<Deleted>(), ComponentType.ReadOnly<Created>() };
             m_ChangedTaperGeometryQuery = GetEntityQuery(
-                new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<Edge>() }, Any = events },
-                new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<Node>() }, Any = events },
-                new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<Game.Net.Lane>() }, Any = events });
+                new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<Edge>() }, Any = events, None = new[] { ComponentType.ReadOnly<Game.Tools.Temp>() } },
+                new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<Node>() }, Any = events, None = new[] { ComponentType.ReadOnly<Game.Tools.Temp>() } },
+                new EntityQueryDesc { All = new[] { ComponentType.ReadOnly<Game.Net.Lane>() }, Any = events, None = new[] { ComponentType.ReadOnly<Game.Tools.Temp>() } });
         }
 
         protected override void OnUpdate()
@@ -2380,7 +2450,18 @@ namespace RoadGrass
             var manager = RoadGrassJoinCompositionSystem.Instance;
             if (manager != null && manager.HasTaperPlans && !m_ChangedTaperGeometryQuery.IsEmptyIgnoreFilter)
             {
-                using var geometry = m_ChangedTaperGeometryQuery.ToEntityArray(Allocator.Temp);
+                if (m_TrackedRevision != manager.TaperDependencyRevision)
+                {
+                    m_TrackedParents.Clear();
+                    if (m_TrackedParents.Capacity < manager.TaperDependencyCount) m_TrackedParents.Capacity = manager.TaperDependencyCount;
+                    foreach (var entity in manager.TaperDependencies) m_TrackedParents.TryAdd(entity, 0);
+                    m_TrackedRevision = manager.TaperDependencyRevision;
+                }
+                using var changedParents = new NativeParallelHashMap<Entity, byte>(math.max(1, manager.TaperDependencyCount), Allocator.TempJob);
+                Dependency = new GatherChangedParentsJob { Entities = GetEntityTypeHandle(), Owners = GetComponentLookup<Owner>(true),
+                    Tracked = m_TrackedParents, Changed = changedParents.AsParallelWriter() }.ScheduleParallel(m_ChangedTaperGeometryQuery, Dependency);
+                Dependency.Complete();
+                using var geometry = changedParents.GetKeyArray(Allocator.Temp);
                 manager.InvalidateTaperGeometry(geometry);
             }
             if (m_ChangedLinkedEdgesQuery.IsEmptyIgnoreFilter && m_ChangedStyledEdgesQuery.IsEmptyIgnoreFilter) return;
@@ -2390,6 +2471,12 @@ namespace RoadGrass
             using NativeArray<Entity> styled = m_ChangedStyledEdgesQuery.ToEntityArray(Allocator.Temp);
             for (int i = 0; i < styled.Length; i++)
                 RoadGrassJoinCompositionSystem.Instance?.InvalidateEndpointStyles(styled[i]);
+        }
+        protected override void OnDestroy()
+        {
+            Dependency.Complete();
+            if (m_TrackedParents.IsCreated) m_TrackedParents.Dispose();
+            base.OnDestroy();
         }
     }
 

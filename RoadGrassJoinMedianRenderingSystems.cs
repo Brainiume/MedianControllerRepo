@@ -69,6 +69,7 @@ namespace RoadGrass
             internal readonly int InstanceIndex;
             internal readonly byte SubMesh;
             internal readonly PropertyLayout Properties;
+            internal readonly int Span;
 
             internal BatchHandle(
                 Entity carrier,
@@ -76,7 +77,7 @@ namespace RoadGrass
                 int groupIndex,
                 int instanceIndex,
                 byte subMesh,
-                PropertyLayout properties)
+                PropertyLayout properties, int span = 0)
             {
                 Carrier = carrier;
                 Mesh = mesh;
@@ -84,6 +85,7 @@ namespace RoadGrass
                 InstanceIndex = instanceIndex;
                 SubMesh = subMesh;
                 Properties = properties;
+                Span = span;
             }
         }
 
@@ -169,7 +171,8 @@ namespace RoadGrass
                 {
                     if (TryGetMedianMesh(state, out _))
                     {
-                        m_Desired.Add(pair.Key);
+                        if (RoadGrassJoinCompositionSystem.Instance.GetMedianRenderSpanCount(pair.Key) > 0)
+                            m_Desired.Add(pair.Key);
                     }
                     else
                     {
@@ -223,7 +226,8 @@ namespace RoadGrass
                              endpoint,
                              out RoadGrassJoinCompositionSystem.VariantState state) ||
                         !TryGetMedianMesh(state, out Entity medianMesh) ||
-                        !HandlesMatchVariant(handles, state.Carrier, medianMesh))
+                        !HandlesMatchVariant(handles, state.Carrier, medianMesh) ||
+                        handles[handles.Count - 1].Span + 1 != RoadGrassJoinCompositionSystem.Instance.GetMedianRenderSpanCount(endpoint))
                     {
                         requiresSync = true;
                         break;
@@ -298,9 +302,12 @@ namespace RoadGrass
                     continue;
                 }
 
-                var handles = new List<BatchHandle>(m_ApplicableGroups.Count);
+                int spanCount = RoadGrassJoinCompositionSystem.Instance.GetMedianRenderSpanCount(endpoint);
+                var handles = new List<BatchHandle>(m_ApplicableGroups.Count * spanCount);
+                m_Batches[endpoint] = handles;
                 bool addedAll = true;
-                for (int i = 0; i < m_ApplicableGroups.Count; i++)
+                for (int i = 0; i < m_ApplicableGroups.Count && addedAll; i++)
+                for (int span = 0; span < spanCount; span++)
                 {
                     if (!TryAddHandle(
                             endpoint,
@@ -310,7 +317,7 @@ namespace RoadGrass
                             groups,
                             instances,
                             subBatches,
-                            out BatchHandle handle))
+                            out BatchHandle handle, span))
                     {
                         addedAll = false;
                         break;
@@ -325,6 +332,7 @@ namespace RoadGrass
                         groups,
                         instances,
                         subBatches);
+                    m_Batches.Remove(endpoint);
                     m_WaitingForMeshes = true;
                     continue;
                 }
@@ -511,7 +519,7 @@ namespace RoadGrass
             NativeBatchGroups<CullingData, GroupData, BatchData, InstanceData> groups,
             NativeBatchInstances<CullingData, GroupData, BatchData, InstanceData> instances,
             NativeSubBatches<CullingData, GroupData, BatchData, InstanceData> subBatches,
-            out BatchHandle handle)
+            out BatchHandle handle, int span = 0)
         {
             handle = default;
             if (!EntityManager.Exists(endpoint.Edge) ||
@@ -536,7 +544,8 @@ namespace RoadGrass
                 m_Entity = carrier,
                 m_MeshGroup = MedianMeshGroup,
                 m_MeshIndex = (byte)subMesh,
-                m_TileIndex = 0
+                // Stable per-span identity survives native instance-array compaction.
+                m_TileIndex = (byte)span
             };
             int instanceIndex = instances.AddInstance(
                 instanceData,
@@ -551,7 +560,7 @@ namespace RoadGrass
                 m_InstanceIndex = instanceIndex,
                 m_MeshGroup = MedianMeshGroup,
                 m_MeshIndex = (byte)subMesh,
-                m_TileIndex = 0
+                m_TileIndex = (byte)span
             });
             handle = new BatchHandle(
                 carrier,
@@ -559,7 +568,7 @@ namespace RoadGrass
                 batchGroup.m_GroupIndex,
                 instanceIndex,
                 (byte)subMesh,
-                new PropertyLayout(groups.GetGroupData(batchGroup.m_GroupIndex)));
+                new PropertyLayout(groups.GetGroupData(batchGroup.m_GroupIndex)), span);
             return true;
         }
 
@@ -588,7 +597,7 @@ namespace RoadGrass
         {
             if (!HandlesMatchVariant(handles, carrier, mesh) ||
                 !TryGetApplicableBatchGroups(mesh, groups, m_ApplicableGroups) ||
-                handles.Count != m_ApplicableGroups.Count)
+                handles.Count != m_ApplicableGroups.Count * RoadGrassJoinCompositionSystem.Instance.GetMedianRenderSpanCount(endpoint))
             {
                 return false;
             }
@@ -633,7 +642,7 @@ namespace RoadGrass
                 MeshBatch batch = batches[i];
                 if (batch.m_GroupIndex == handle.GroupIndex &&
                     batch.m_MeshGroup == MedianMeshGroup &&
-                    batch.m_MeshIndex == handle.SubMesh)
+                    batch.m_MeshIndex == handle.SubMesh && batch.m_TileIndex == handle.Span)
                 {
                     resolved = new BatchHandle(
                         handle.Carrier,
@@ -641,7 +650,7 @@ namespace RoadGrass
                         handle.GroupIndex,
                         batch.m_InstanceIndex,
                         handle.SubMesh,
-                        handle.Properties);
+                        handle.Properties, handle.Span);
                     return true;
                 }
             }
@@ -669,7 +678,7 @@ namespace RoadGrass
                 instances.GetInstanceData(handle.GroupIndex, handle.InstanceIndex);
             if (data.m_Entity != handle.Carrier ||
                 data.m_MeshGroup != MedianMeshGroup ||
-                data.m_MeshIndex != handle.SubMesh)
+                data.m_MeshIndex != handle.SubMesh || data.m_TileIndex != handle.Span)
             {
                 return false;
             }
@@ -682,7 +691,7 @@ namespace RoadGrass
                 if (batch.m_GroupIndex == handle.GroupIndex &&
                     batch.m_InstanceIndex == handle.InstanceIndex &&
                     batch.m_MeshGroup == MedianMeshGroup &&
-                    batch.m_MeshIndex == handle.SubMesh)
+                    batch.m_MeshIndex == handle.SubMesh && batch.m_TileIndex == handle.Span)
                 {
                     return true;
                 }
@@ -734,7 +743,7 @@ namespace RoadGrass
                     MeshBatch batch = batches[i];
                     if (batch.m_GroupIndex == handle.GroupIndex &&
                         batch.m_MeshGroup == MedianMeshGroup &&
-                        batch.m_MeshIndex == handle.SubMesh)
+                        batch.m_MeshIndex == handle.SubMesh && batch.m_TileIndex == handle.Span)
                     {
                         handle = new BatchHandle(
                             handle.Carrier,
@@ -742,7 +751,7 @@ namespace RoadGrass
                             handle.GroupIndex,
                             batch.m_InstanceIndex,
                             handle.SubMesh,
-                            handle.Properties);
+                            handle.Properties, handle.Span);
                         batches.RemoveAt(i);
                         foundBatch = true;
                         break;
@@ -766,7 +775,7 @@ namespace RoadGrass
                 instances.GetInstanceData(handle.GroupIndex, handle.InstanceIndex);
             if (current.m_Entity != handle.Carrier ||
                 current.m_MeshGroup != MedianMeshGroup ||
-                current.m_MeshIndex != handle.SubMesh)
+                current.m_MeshIndex != handle.SubMesh || current.m_TileIndex != handle.Span)
             {
                 // Vanilla may already have removed this instance while
                 // rebuilding the edge's normal batches. Never remove whatever
@@ -839,6 +848,7 @@ namespace RoadGrass
                         handle.GroupIndex == groupIndex &&
                         handle.InstanceIndex == movedFromIndex &&
                         moved.m_MeshGroup == MedianMeshGroup &&
+                        moved.m_TileIndex == handle.Span &&
                         moved.m_MeshIndex == handle.SubMesh)
                     {
                         handles[i] = new BatchHandle(
@@ -847,7 +857,7 @@ namespace RoadGrass
                             handle.GroupIndex,
                             replacementIndex,
                             handle.SubMesh,
-                            handle.Properties);
+                            handle.Properties, handle.Span);
                         AdvanceBatchRevision();
                         return;
                     }
@@ -961,7 +971,7 @@ namespace RoadGrass
                 for (int batchIndex = 0; batchIndex < carrierBatches.Length; batchIndex++)
                 {
                     MeshBatch batch = carrierBatches[batchIndex];
-                    if (batch.m_GroupIndex == handle.GroupIndex &&
+                    if (batch.m_TileIndex == handle.Span && batch.m_GroupIndex == handle.GroupIndex &&
                         batch.m_MeshGroup == RoadGrassJoinMedianBatchSystem.MedianMeshGroup &&
                         batch.m_MeshIndex == handle.SubMesh)
                     {
@@ -979,7 +989,7 @@ namespace RoadGrass
                     Instances.GetInstanceData(handle.GroupIndex, instanceIndex);
                 if (instance.m_Entity != handle.Carrier ||
                     instance.m_MeshGroup != RoadGrassJoinMedianBatchSystem.MedianMeshGroup ||
-                    instance.m_MeshIndex != handle.SubMesh)
+                    instance.m_MeshIndex != handle.SubMesh || instance.m_TileIndex != handle.Span)
                 {
                     return;
                 }
@@ -989,7 +999,7 @@ namespace RoadGrass
                     handle.GroupIndex,
                     instanceIndex,
                     handle.SubMesh,
-                    handle.Properties);
+                    handle.Properties, handle.Span);
 
                 BatchDataHelpers.CompositionParameters parameters = command.Parameters;
                 ref CullingData culling = ref writer.SetTransformValue(
@@ -1131,17 +1141,14 @@ namespace RoadGrass
             {
                 RoadGrassMedianAnchorKey endpoint = pair.Key;
                 if (!variants.ContainsKey(endpoint) ||
-                    !batchSystem.TryGetBatches(endpoint, out var handles) ||
-                    !manager.TryGetMedianRenderState(
-                        endpoint,
-                        pair.Value,
-                        out BatchDataHelpers.CompositionParameters parameters,
-                        out Bounds3 geometryBounds))
+                    !batchSystem.TryGetBatches(endpoint, out var handles))
                 {
                     continue;
                 }
                 for (int i = 0; i < handles.Count; i++)
                 {
+                    if (!manager.TryGetMedianRenderState(endpoint, pair.Value,
+                        out BatchDataHelpers.CompositionParameters parameters, out Bounds3 geometryBounds, handles[i].Span)) continue;
                     replacement.Add(new MedianBatchWrite
                     {
                         Edge = endpoint.Edge,

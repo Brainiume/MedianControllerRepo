@@ -6,7 +6,13 @@ namespace RoadGrass
 {
     internal static class RoadGrassLaneGuideResolver
     {
-        internal static List<float3> FollowEdge(float3 start, float3 end, IReadOnlyList<RoadGrassTaperGeometry.Lane> lanes)
+        internal static bool TouchesOpening(float3 start, float3 end, Game.Net.Segment opening) =>
+            math.distance(start.xz, opening.m_Left.d.xz) <= .25f ||
+            math.distance(start.xz, opening.m_Right.d.xz) <= .25f ||
+            math.distance(end.xz, opening.m_Left.d.xz) <= .25f ||
+            math.distance(end.xz, opening.m_Right.d.xz) <= .25f;
+
+        internal static List<float3> FollowEdge(float3 start, float3 end, IReadOnlyList<RoadGrassTaperGeometry.Lane> lanes, bool requireGuide = false)
         {
             List<float3> best = null;
             float score = 1.5f;
@@ -26,7 +32,7 @@ namespace RoadGrass
                     if (da < a) { a = da; from = i; }
                     if (db < b) { b = db; to = i; }
                 }
-                if (a > .75f || b > .75f || a + b >= score || from == to) continue;
+                if (a > (requireGuide ? .4f : .75f) || b > (requireGuide ? .4f : .75f) || a + b >= score || from == to) continue;
                 int direction = to > from ? 1 : -1;
                 var path = new List<float3> { start };
                 for (int i = from + direction; i != to; i += direction)
@@ -45,7 +51,7 @@ namespace RoadGrass
                 }
                 score = a + b; best = path;
             }
-            return best ?? new List<float3> { start, end };
+            return best ?? (requireGuide ? null : new List<float3> { start, end });
         }
         // A supported contour is one forward lane-guided strip. Arbitrary closed
         // polygons and guide switches are rejected rather than rendered approximately.

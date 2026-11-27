@@ -100,7 +100,7 @@ namespace RoadGrass
             if (!RoadGrassMedianAnchorResolver.TryResolveAll(EntityManager, anchor.Key.Edge, anchor.Key.End,
                 GetBufferLookup<NetSubSection>(true), GetBufferLookup<NetSectionPiece>(true),
                 GetComponentLookup<NetPieceData>(true), GetComponentLookup<NetVertexMatchData>(true),
-                out var candidates, flags) ||
+                out var candidates, out _, flags) ||
                 !RoadGrassMedianAnchorResolver.TryMatch(candidates, anchor.Data, out result)) return false;
             // A style must not move/widen the divider or select a neighbouring ordinal.
             return result.Data.RootSection == anchor.Data.RootSection &&
@@ -145,20 +145,19 @@ namespace RoadGrass
             // inserted as a flat node cap stretches over the node's fan geometry.
             if (!TryResolveStyleAnchor(anchor, sourceData.m_Flags, out var originalCap)) return false;
             CompositionFlags capFlags = MedianEndpointProfiles.GetCapFlags(sourceData.m_Flags, cap);
-            if (!TryResolveStyleAnchor(anchor, anchor.RoadComposition.m_Flags, out var continuation) ||
-                !TryResolveStyleAnchor(anchor, capFlags, out var endpointCap)) return false;
-            if (!extend && cap != MedianSavedCap.None &&
+            if (!TryResolveStyleAnchor(anchor, anchor.RoadComposition.m_Flags, out var continuation))
+            {
+                if (cap != MedianSavedCap.Straight || extend) return false;
+                continuation = originalCap;
+            }
+            if (!TryResolveStyleAnchor(anchor, capFlags, out var endpointCap))
+            {
+                if (cap != MedianSavedCap.Straight || extend) return false;
+                endpointCap = originalCap;
+            }
+            if (!extend && cap == MedianSavedCap.Rounded &&
                 CompositionPiecesEqual(endpointCap.Pieces, continuation.Pieces))
                 return false;
-            if (!extend && cap == MedianSavedCap.Straight)
-            {
-                // A prefab that ignores Crosswalk has not supplied a distinct flat
-                // cap. Reject it instead of accepting its ordinary rounded end.
-                CompositionFlags withoutCrosswalk = capFlags;
-                withoutCrosswalk.m_General &= ~CompositionFlags.General.Crosswalk;
-                if (!TryResolveStyleAnchor(anchor, withoutCrosswalk, out var ordinaryCap) ||
-                    CompositionPiecesEqual(endpointCap.Pieces, ordinaryCap.Pieces)) return false;
-            }
             int sectionIndex = originalCap.Pieces[0].m_SectionIndex;
             var sourcePieces = EntityManager.GetBuffer<NetCompositionPiece>(source, true);
             var original = new List<NetCompositionPiece>();
@@ -192,7 +191,7 @@ namespace RoadGrass
 
         internal bool CanEditEndpoint(RoadGrassResolvedMedianAnchor anchor, MedianCapChoice cap, MedianSurfaceChoice surface, bool extendIntoIntersection = false)
         {
-            if ((uint)cap > 1 || (uint)surface > 1 || m_CityQuery.IsEmptyIgnoreFilter) return false;
+            if ((uint)cap > 1 || m_CityQuery.IsEmptyIgnoreFilter) return false;
             var savedCap = cap == MedianCapChoice.Rounded ? MedianSavedCap.Rounded : MedianSavedCap.Straight;
             return (!extendIntoIntersection || (anchor != null && !m_ActivePairs.ContainsKey(anchor.Key) && TryGetTaperStart(anchor,out _))) &&
                 TryPlanEndpoint(anchor, extendIntoIntersection ? MedianSavedCap.None : savedCap, out _, extendIntoIntersection) &&
@@ -211,7 +210,7 @@ namespace RoadGrass
                 Surface = MedianSavedSurface.None,
                 ExtendIntoIntersection = extendIntoIntersection
             });
-            StoreSegmentSurface(GetSegmentForEndpoint(anchor), surface == MedianSurfaceChoice.Grass ? MedianSavedSurface.Grass : MedianSavedSurface.Plain);
+            TryEditSegmentSurface(GetSegmentForEndpoint(anchor), surface);
             return true;
         }
 
@@ -291,7 +290,7 @@ namespace RoadGrass
                 m_Styles[style.Key] = style;
                 TrackStyledEdge(style.Edge);
             }
-            m_Dirty = true;
+            QueueMedianEdit(style.Edge);
         }
 
         private void TrackStyledEdge(Entity edge)
@@ -314,12 +313,12 @@ namespace RoadGrass
             styles.Clear();
             foreach (var saved in copy)
             {
-                if (!EntityManager.Exists(saved.Edge) || EntityManager.HasComponent<Deleted>(saved.Edge) ||
+                if (IsParentRoadDeleted(saved.Edge) ||
                     (saved.Cap == MedianSavedCap.None && saved.Surface == MedianSavedSurface.None && !saved.ExtendIntoIntersection)) continue;
                 var style = saved;
                 if (TryResolveSavedAnchor(saved.Edge, saved.Anchor, out var anchor))
                 {
-                    if (anchor.Node != saved.Node) continue;
+                    if (anchor.Node != saved.Node && !RoadGrassSettings.AutomaticMedianDeletionDisabled) continue;
                     style.Anchor = anchor.Data;
                 }
                 // A generated prefab may still be unavailable after loading. Preserve its
@@ -336,7 +335,7 @@ namespace RoadGrass
             }
         }
 
-        private void SynchronizeEndpointMeshes()
+        private void SynchronizeEndpointMeshes(HashSet<Entity> edges = null)
         {
             var desired = new Dictionary<EndpointCacheKey, List<EndpointStylePlan>>();
             // Only explicit cap edits own road endpoint meshes. Connections and
@@ -345,6 +344,7 @@ namespace RoadGrass
             {
                 var key = entry.Key;
                 var style = entry.Value;
+                if (edges != null && !edges.Contains(style.Edge)) continue;
                 if ((!style.ExtendIntoIntersection && style.Cap == MedianSavedCap.None) ||
                     !TryResolveSavedAnchor(style.Edge, style.Anchor, out var anchor) ||
                     anchor.Node != style.Node || !anchor.Key.Equals(key)) continue;
@@ -359,6 +359,7 @@ namespace RoadGrass
             }
             foreach (var median in m_ManualMedians.Values)
             {
+                if (edges != null && !edges.Contains(median.Saved.Edge)) continue;
                 if (median.Points.Count >= 3)
                 {
                     if (TryGetPolygonCapPlan(median, out var polygonPlan))
@@ -378,7 +379,8 @@ namespace RoadGrass
                 plans.Add(plan);
             }
             var obsolete = new List<EndpointCacheKey>();
-            foreach (var key in m_EndpointMeshes.Keys) if (!desired.ContainsKey(key)) obsolete.Add(key);
+            foreach (var key in m_EndpointMeshes.Keys)
+                if ((edges == null || edges.Contains(key.Edge)) && !desired.ContainsKey(key)) obsolete.Add(key);
             foreach (var key in obsolete) RestoreEndpointMesh(key);
             foreach (var entry in desired)
             {
@@ -428,6 +430,7 @@ namespace RoadGrass
             foreach (var endpoint in m_EndpointMeshes.Keys) retained.Add(endpoint.Edge);
             foreach (var edge in new List<Entity>(m_StyledEdges))
             {
+                if (edges != null && !edges.Contains(edge)) continue;
                 if (retained.Contains(edge)) continue;
                 if (EntityManager.Exists(edge) && EntityManager.HasComponent<RoadGrassStyledEdge>(edge))
                     EntityManager.RemoveComponent<RoadGrassStyledEdge>(edge);
@@ -471,10 +474,10 @@ namespace RoadGrass
 
         private void ClearEndpointStyles()
         {
+            ClearTerrainMedianFills();
             RestoreAllEndpointMeshes();
             if (TryGetSegmentSurfaces(false, out var surfaces)) surfaces.Clear();
             m_SegmentSurfaces.Clear();
-            m_PendingSegmentSurfaces = false;
             if (TryGetEndpointStyles(false, out var styles)) styles.Clear();
             foreach (var edge in m_StyledEdges)
                 if (EntityManager.Exists(edge) && EntityManager.HasComponent<RoadGrassStyledEdge>(edge))
@@ -486,6 +489,7 @@ namespace RoadGrass
 
         private RoadGrassResolvedMedianAnchor GetStyledContinuation(RoadGrassResolvedMedianAnchor anchor)
         {
+            if (anchor.Key.IsRoadsideGrass) return anchor;
             var segment = GetSegmentForEndpoint(anchor);
             MedianSavedSurface surface = MedianSavedSurface.None;
             if (segment != null && m_SegmentSurfaces.TryGetValue((segment.Key.Edge, segment.Key.Ordinal), out var style))
@@ -522,7 +526,7 @@ namespace RoadGrass
 
         internal void InvalidateEndpointStyles(Entity edge)
         {
-            bool deleted = !EntityManager.Exists(edge) || EntityManager.HasComponent<Deleted>(edge);
+            bool deleted = IsParentRoadDeleted(edge);
             if (!deleted)
             {
                 if (!TryCaptureTaperStamp(edge, out var current)) return;
@@ -538,6 +542,7 @@ namespace RoadGrass
                     return;
                 }
                 m_StyledEdgeStamps[edge] = current;
+                if (RoadGrassSettings.AutomaticMedianDeletionDisabled) { m_Dirty = true; return; }
             }
             else m_StyledEdgeStamps.Remove(edge);
             RemoveGeneratedMediansForGeometry(edge);

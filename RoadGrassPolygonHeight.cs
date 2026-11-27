@@ -67,7 +67,19 @@ namespace RoadGrass
 
     internal static class RoadGrassPolygonSurface
     {
-        internal struct Triangle { internal float3 A, B, C; }
+        internal struct Triangle
+        {
+            internal float3 A, B, C;
+            internal float2 U, V, Min, Max;
+            internal float Determinant;
+            internal bool Prepared;
+            internal Triangle(float3 a, float3 b, float3 c)
+            {
+                A = a; B = b; C = c; U = b.xz - a.xz; V = c.xz - a.xz;
+                Min = math.min(a.xz, math.min(b.xz, c.xz)); Max = math.max(a.xz, math.max(b.xz, c.xz));
+                Determinant = Cross(U, V); Prepared = true;
+            }
+        }
 
         internal static void Add(Segment strip, List<Triangle> triangles)
         {
@@ -75,8 +87,8 @@ namespace RoadGrass
             for (int i = 1; i <= 16; i++)
             {
                 float3 a = MathUtils.Position(strip.m_Left, i / 16f), b = MathUtils.Position(strip.m_Right, i / 16f);
-                triangles.Add(new Triangle { A = left, B = right, C = a });
-                triangles.Add(new Triangle { A = right, B = b, C = a });
+                triangles.Add(new Triangle(left, right, a));
+                triangles.Add(new Triangle(right, b, a));
                 left = a; right = b;
             }
         }
@@ -86,9 +98,11 @@ namespace RoadGrass
             float best = float.MaxValue, height = p.y, vertical = float.MaxValue;
             foreach (var triangle in triangles)
             {
-                float3 a = triangle.A, b = triangle.B, c = triangle.C;
-                float2 u = b.xz - a.xz, v = c.xz - a.xz, w = p.xz - a.xz;
-                float determinant = Cross(u, v);
+                var data = triangle.Prepared ? triangle : new Triangle(triangle.A, triangle.B, triangle.C);
+                if (math.distancesq(p.xz, math.clamp(p.xz, data.Min, data.Max)) > best) continue;
+                float3 a = data.A, b = data.B, c = data.C;
+                float2 u = data.U, v = data.V, w = p.xz - a.xz;
+                float determinant = data.Determinant;
                 if (math.abs(determinant) < .000001f) continue;
                 float x = Cross(w, v) / determinant, y = Cross(u, w) / determinant;
                 if (x >= 0 && y >= 0 && x + y <= 1) Consider(0, a.y + x * (b.y - a.y) + y * (c.y - a.y));

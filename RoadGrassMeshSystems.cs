@@ -70,6 +70,8 @@ namespace RoadGrass
         }
 
         private static readonly List<Selection> PendingSelections = new();
+        private static int PendingHead;
+        private static readonly HashSet<(Entity, RoadGrassArea)> PendingKeys = new();
         internal static Entity InjectedComposition;
         internal static readonly List<NetCompositionPiece> OriginalPieces = new();
         internal static readonly Dictionary<Entity, CompositionState> CompositionStates = new();
@@ -77,6 +79,8 @@ namespace RoadGrass
         internal static void Reset()
         {
             PendingSelections.Clear();
+            PendingHead = 0;
+            PendingKeys.Clear();
             InjectedComposition = Entity.Null;
             OriginalPieces.Clear();
             CompositionStates.Clear();
@@ -84,15 +88,7 @@ namespace RoadGrass
 
         internal static bool Enqueue(Entity edge, RoadGrassArea area)
         {
-            for (int i = 0; i < PendingSelections.Count; i++)
-            {
-                Selection pending = PendingSelections[i];
-                if (pending.Edge == edge && pending.Area == area)
-                {
-                    return false;
-                }
-            }
-
+            if (!PendingKeys.Add((edge, area))) return false;
             PendingSelections.Add(new Selection(edge, area));
             return true;
         }
@@ -105,8 +101,11 @@ namespace RoadGrass
                 return false;
             }
 
-            selection = PendingSelections[0];
-            PendingSelections.RemoveAt(0);
+            selection = PendingSelections[PendingHead++];
+            PendingKeys.Remove((selection.Edge, selection.Area));
+            if (PendingHead == PendingSelections.Count) { PendingSelections.Clear(); PendingHead = 0; }
+            else if (PendingHead > 1024 && PendingHead > PendingSelections.Count / 2)
+            { PendingSelections.RemoveRange(0, PendingHead); PendingHead = 0; }
             return true;
         }
 

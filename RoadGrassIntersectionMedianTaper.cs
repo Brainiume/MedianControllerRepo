@@ -35,6 +35,9 @@ namespace RoadGrass
         private readonly HashSet<Entity> m_TaperDependencies = new();
         private readonly Dictionary<Entity, EdgeRuntimeStamp> m_TaperDependencyStamps = new();
         internal bool HasTaperPlans => m_TaperPlans.Count != 0 || m_TaperSnapPoints.Count != 0 || m_ManualMedians.Count != 0;
+        internal int TaperDependencyRevision { get; private set; }
+        internal int TaperDependencyCount => m_TaperDependencies.Count;
+        internal IEnumerable<Entity> TaperDependencies => m_TaperDependencies;
 
         internal bool TryBuildTaperPreview(RoadGrassResolvedMedianAnchor anchor, out EdgeGeometry geometry)
         {
@@ -65,13 +68,16 @@ namespace RoadGrass
             ClearRoadGuideCaches();
             m_PolygonProfiles.Clear();
             m_TaperDependencies.Clear();
+            TaperDependencyRevision++;
             m_TaperDependencyStamps.Clear();
         }
 
+        private int m_PolygonGuideEpoch;
         private void ClearRoadGuideCaches()
         {
+            m_PolygonGuideEpoch++;
             m_PolygonReferenceGuides.Clear();
-            m_TaperSnapPoints.Clear();
+            m_TaperSnapPoints.Clear(); m_ContourGraphs.Clear();
             foreach (var builder in m_TaperSnapBuilders.Values) builder.Dispose();
             m_TaperSnapBuilders.Clear();
             m_PolygonGuides.Clear(); m_PolygonGuideEdges.Clear();
@@ -83,7 +89,7 @@ namespace RoadGrass
         {
             if (!EntityManager.HasComponent<Edge>(entity) && !EntityManager.HasComponent<Node>(entity) &&
                 EntityManager.TryGetComponent(entity, out Owner owner)) entity = owner.m_Owner;
-            m_TaperDependencies.Add(entity);
+            if (m_TaperDependencies.Add(entity)) TaperDependencyRevision++;
             if (!m_TaperDependencyStamps.ContainsKey(entity) && TryCaptureTaperStamp(entity, out var stamp))
                 m_TaperDependencyStamps[entity] = stamp;
         }
@@ -98,16 +104,6 @@ namespace RoadGrass
             {
                 if (!TryCaptureEdgeStamp(entity, out var edge)) return false;
                 start = edge.Start; end = edge.End; hash = edge.Geometry;
-                if (EntityManager.TryGetComponent(entity, out StartNodeGeometry a))
-                {
-                    AccumulateSegmentStamp(ref hash, a.m_Geometry.m_Left);
-                    AccumulateSegmentStamp(ref hash, a.m_Geometry.m_Right);
-                }
-                if (EntityManager.TryGetComponent(entity, out EndNodeGeometry b))
-                {
-                    AccumulateSegmentStamp(ref hash, b.m_Geometry.m_Left);
-                    AccumulateSegmentStamp(ref hash, b.m_Geometry.m_Right);
-                }
             }
             else if (EntityManager.TryGetComponent(entity, out Node node))
             {
@@ -121,23 +117,8 @@ namespace RoadGrass
             else return false;
             if (EntityManager.TryGetComponent(entity, out PrefabRef prefab))
                 hash = (hash ^ (uint)prefab.m_Prefab.GetHashCode()) * 16777619u;
-            // Ignore signal flags and lane entity IDs. Native updates can replace
-            // lanes with equivalent curves; neither requires new median meshes.
-            uint lanes = 0, count = 0;
-            if (EntityManager.HasBuffer<SubLane>(entity))
-                foreach (var item in EntityManager.GetBuffer<SubLane>(entity, true))
-                {
-                    if (EntityManager.HasComponent<Deleted>(item.m_SubLane) ||
-                        !EntityManager.TryGetComponent(item.m_SubLane, out Game.Net.Curve curve)) continue;
-                    uint lane = 2166136261u;
-                    AccumulateStamp(ref lane, curve.m_Bezier.a); AccumulateStamp(ref lane, curve.m_Bezier.b);
-                    AccumulateStamp(ref lane, curve.m_Bezier.c); AccumulateStamp(ref lane, curve.m_Bezier.d);
-                    if (EntityManager.TryGetComponent(item.m_SubLane, out PrefabRef lanePrefab) &&
-                        EntityManager.TryGetComponent(lanePrefab.m_Prefab, out NetLaneData data))
-                        AccumulateStamp(ref lane, new float2(data.m_Width, 0));
-                    lanes += lane; count++;
-                }
-            hash = ((hash ^ lanes) * 16777619u ^ count) * 16777619u;
+            // Generated lanes/junction cutbacks can change when traffic lights are edited.
+            // They must not delete generated medians or trigger polygon remeshing.
             stamp = new EdgeRuntimeStamp(start, end, hash);
             return true;
         }
@@ -158,7 +139,7 @@ namespace RoadGrass
                     RemoveGeneratedMediansForGeometry(dependency);
                     if (deleted)
                     {
-                        m_TaperDependencies.Remove(dependency);
+                        if (m_TaperDependencies.Remove(dependency)) TaperDependencyRevision++;
                         m_TaperDependencyStamps.Remove(dependency);
                     }
                     else if (TryCaptureTaperStamp(dependency, out var updated))
@@ -169,6 +150,7 @@ namespace RoadGrass
 
         private void RemoveGeneratedMediansForGeometry(Entity dependency)
         {
+            if (RoadGrassSettings.AutomaticMedianDeletionDisabled && !IsParentRoadDeleted(dependency)) return;
             // Include deleted nodes whose Node component may already be gone.
             var nodes = new HashSet<Entity> { dependency };
             if (EntityManager.TryGetComponent(dependency, out Edge road))
@@ -178,8 +160,10 @@ namespace RoadGrass
             { nodes.Add(previous.Start); nodes.Add(previous.End); }
             nodes.Remove(Entity.Null);
 
-            bool Affected(Entity edge, Entity node) => edge == dependency || nodes.Contains(node);
-            bool AffectedAnchor(Entity edge, RoadGrassMedianAnchorData anchor) => edge == dependency ||
+            bool Affected(Entity edge, Entity node) => RoadGrassSettings.AutomaticMedianDeletionDisabled
+                ? IsParentRoadDeleted(edge) : edge == dependency || nodes.Contains(node);
+            bool AffectedAnchor(Entity edge, RoadGrassMedianAnchorData anchor) => RoadGrassSettings.AutomaticMedianDeletionDisabled
+                ? IsParentRoadDeleted(edge) : edge == dependency ||
                 (EntityManager.TryGetComponent(edge, out Edge data) && nodes.Contains(anchor.End ? data.m_End : data.m_Start));
 
             var pairIds = new List<ulong>();
@@ -193,7 +177,13 @@ namespace RoadGrass
 
             var manualIds = new List<int>();
             foreach (var entry in m_ManualMedians)
-                if (Affected(entry.Value.Saved.Edge, entry.Value.Saved.Node)) manualIds.Add(entry.Key);
+            {
+                var median = entry.Value;
+                bool remove = median.Points.Count >= 3
+                    ? HasDeletedManualParent(median)
+                    : Affected(median.Saved.Edge, median.Saved.Node);
+                if (remove) manualIds.Add(entry.Key);
+            }
             foreach (var id in manualIds) RemoveManualMedian(id);
             foreach (var style in new List<RoadGrassSavedEndpointStyle>(m_Styles.Values))
             {
@@ -313,20 +303,44 @@ namespace RoadGrass
             return true;
         }
 
-        private void SynchronizeIntersectionTapers()
+        private void SynchronizeIntersectionTapers(HashSet<Entity> edges = null)
         {
-            m_RenderPairs.Clear();
-            foreach (var pair in m_ActivePairs) m_RenderPairs.Add(pair.Key, pair.Value);
+            if (edges == null) m_RenderPairs.Clear();
+            else
+            {
+                m_RemoveKeys.Clear();
+                foreach (var key in m_RenderPairs.Keys) if (edges.Contains(key.Edge)) m_RemoveKeys.Add(key);
+                foreach (var key in m_RemoveKeys) m_RenderPairs.Remove(key);
+            }
+            foreach (var pair in m_ActivePairs)
+                if (edges == null || edges.Contains(pair.Key.Edge)) m_RenderPairs[pair.Key] = pair.Value;
             foreach (var style in m_Styles.Values)
             {
-                if (!style.ExtendIntoIntersection || !TryResolveSavedAnchor(style.Edge, style.Anchor, out var anchor) ||
+                if (edges != null && !edges.Contains(style.Edge)) continue;
+                if (!style.ExtendIntoIntersection) continue;
+                if (!TryResolveSavedAnchor(style.Edge, style.Anchor, out var anchor) ||
                     anchor.Node != style.Node || !TryPlanIntersectionTaper(anchor, out var half) ||
-                    !TryPlanEndpoint(anchor, MedianSavedCap.None, out _, true)) continue;
+                    !TryPlanEndpoint(anchor, MedianSavedCap.None, out _, true))
+                { RetainProtectedVariant(style.Key); continue; }
                 m_RenderPairs[anchor.Key] = anchor.Key;
                 m_Resolved[anchor.Key] = half.Source;
                 BatchDataHelpers.CalculateNodeParameters(half.Geometry, half.Composition, out var parameters);
                 m_RenderStates[anchor.Key] = new MedianRenderState(anchor.Key, parameters, half.Geometry.m_Bounds);
             }
+        }
+
+        private void RetainProtectedVariant(RoadGrassMedianAnchorKey key)
+        {
+            if (!RoadGrassSettings.AutomaticMedianDeletionDisabled ||
+                IsParentRoadDeleted(key.Edge) ||
+                !m_Variants.TryGetValue(key, out var variant) || variant.Transition == null ||
+                !EntityManager.Exists(variant.Carrier) || !EntityManager.Exists(variant.MedianComposition)) return;
+            var half = variant.Transition;
+            m_RenderPairs[key] = key;
+            m_Resolved[key] = variant.Anchor;
+            BatchDataHelpers.CalculateNodeParameters(half.Geometry, half.Composition, out var parameters);
+            m_RenderStates[key] = new MedianRenderState(key, parameters, half.Geometry.m_Bounds);
+            m_RetainedPairAnchors.Add(key);
         }
     }
 }

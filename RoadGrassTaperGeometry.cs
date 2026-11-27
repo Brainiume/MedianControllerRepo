@@ -10,7 +10,7 @@ namespace RoadGrass
     {
         internal const float Inset = 0.12f;
         private const float Error = 0.015f;
-        internal struct Lane { internal Bezier4x3 Curve; internal float Width; }
+        internal struct Lane { internal Bezier4x3 Curve; internal float Width; internal string Family; internal bool Marking, Median; }
         private struct Block { internal float2 A, B; internal float Radius; }
 
         internal static bool TryBuildManual(Segment approach, float3 tip, float radius,
@@ -315,7 +315,7 @@ namespace RoadGrass
         private static bool Crosses(float2 a,float2 b,float2 c,float2 d)=>
             Cross(b-a,c-a)*Cross(b-a,d-a)<-0.000001f && Cross(d-c,a-c)*Cross(d-c,b-c)<-0.000001f;
         private static float PointDistance(float2 p,float2 a,float2 b)=>math.distance(p,math.lerp(a,b,math.saturate(math.dot(p-a,b-a)/math.max(1e-9f,math.lengthsq(b-a)))));
-        private static float Distance(float2 a,float2 b,float2 c,float2 d)=>Crosses(a,b,c,d)?0:
+        internal static float Distance(float2 a,float2 b,float2 c,float2 d)=>Crosses(a,b,c,d)?0:
             math.min(math.min(PointDistance(a,c,d),PointDistance(b,c,d)),math.min(PointDistance(c,a,b),PointDistance(d,a,b)));
         private static bool Inside(float2 p,List<float2> polygon)
         {

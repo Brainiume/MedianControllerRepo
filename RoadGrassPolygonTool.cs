@@ -15,17 +15,92 @@ namespace RoadGrass
         private readonly List<int> m_PolygonCornerStarts = new();
         private readonly List<bool> m_PolygonCornerSnaps = new();
         internal bool HasPolygonCorners => Options.ActiveMode == MedianControllerMode.Polygon && m_PolygonPoints.Count > 0;
+        private int m_EditingPolygonId, m_DragPolygonPoint = -1;
+        private List<float3> m_PolygonEditPoints;
+        internal bool PolygonPointEditing => m_EditingPolygonId != 0 && Options.ActiveMode == MedianControllerMode.Edit &&
+            RoadGrassJoinCompositionSystem.Instance?.SelectedManualMedianId == m_EditingPolygonId;
+
+        internal void SetPolygonPointEditing(bool enabled)
+        {
+            m_EditingPolygonId = 0; m_DragPolygonPoint = -1; m_PolygonEditPoints = null;
+            var manager = RoadGrassJoinCompositionSystem.Instance;
+            if (!enabled || manager?.SelectedIsPolygon != true || !manager.CanEditSelectedManualMedian) return;
+            int selected = manager.SelectedManualMedianId;
+            Options.SetActiveMode((int)MedianControllerMode.Edit);
+            manager.SelectManualMedian(selected);
+            m_EditingPolygonId = selected;
+        }
+
+        private JobHandle UpdatePolygonPoints(JobHandle inputDeps, RoadGrassJoinCompositionSystem manager,
+            bool hasRay, Line3.Segment ray, float fovTan)
+        {
+            if (!manager.TryGetSelectedPolygonPoints(out var source, out var saved))
+            { SetPolygonPointEditing(false); return inputDeps; }
+            var points = m_PolygonEditPoints ?? saved;
+            var commands = new NativeList<OverlayCommand>(Allocator.TempJob);
+            AddManualMedianOutline(ref commands, manager, m_EditingPolygonId, SelectedColor);
+            float3 insertion = default, delta = ray.b - ray.a;
+            int2 handles = hasRay ? RoadGrassPolygonSections.PickEditHandles(points, ray, fovTan, out insertion) : new int2(-1);
+            int vertex = handles.x, edge = handles.y;
+            if (m_DragPolygonPoint >= 0)
+            {
+                if (hasRay && math.abs(delta.y) > .0001f)
+                {
+                    float t = (points[m_DragPolygonPoint].y + .25f - ray.a.y) / delta.y;
+                    if (t >= 0 && t <= 1)
+                        points[m_DragPolygonPoint] = manager.ProjectPolygonEditPoint(source, ray.a + delta * t - new float3(0, .25f, 0));
+                }
+                if (secondaryApplyAction.WasReleasedThisFrame())
+                { m_DragPolygonPoint = -1; m_PolygonEditPoints = null; points = saved; }
+                else if (applyAction.WasReleasedThisFrame())
+                {
+                    if (!manager.SetSelectedPolygonPoints(points)) points = saved;
+                    m_DragPolygonPoint = -1; m_PolygonEditPoints = null;
+                }
+            }
+            else if (hasRay && vertex >= 0 && secondaryApplyAction.WasReleasedThisFrame())
+            {
+                if (points.Count > 3)
+                {
+                    var changed = new List<float3>(points); changed.RemoveAt(vertex);
+                    if (manager.SetSelectedPolygonPoints(changed)) points = changed;
+                }
+            }
+            else if (hasRay && applyAction.WasPressedThisFrame())
+            {
+                if (vertex >= 0)
+                { m_PolygonEditPoints = new List<float3>(points); m_DragPolygonPoint = vertex; }
+                else if (edge >= 0)
+                {
+                    var changed = new List<float3>(points); changed.Insert(edge + 1, insertion);
+                    if (manager.SetSelectedPolygonPoints(changed)) points = changed;
+                }
+            }
+            TooltipState = vertex >= 0 || m_DragPolygonPoint >= 0 ? RoadGrassJoinTooltipState.DragPolygonPoint :
+                edge >= 0 ? RoadGrassJoinTooltipState.InsertPolygonPoint : RoadGrassJoinTooltipState.EditPolygonPoints;
+            for (int i = 0; i < points.Count; i++)
+            {
+                float3 p = points[i] + new float3(0, .25f, 0), end = points[(i + 1) % points.Count] + new float3(0, .25f, 0);
+                AddLine(ref commands, SelectedColor, new Line3.Segment(p, end), OutlineWidth);
+                AddLine(ref commands, i == vertex || i == m_DragPolygonPoint ? HoverColor : SelectedColor,
+                    new Line3.Segment(p - new float3(.15f, 0, 0), p + new float3(.15f, 0, 0)), .3f);
+            }
+            var buffer = m_OverlayRenderSystem.GetBuffer(out JobHandle dependencies);
+            var result = new DrawOverlayJob { Commands = commands.AsArray(), Buffer = buffer }
+                .Schedule(JobHandle.CombineDependencies(inputDeps, dependencies));
+            m_OverlayRenderSystem.AddBufferWriter(result); commands.Dispose(result);
+            return result;
+        }
+
         private int PickManualMedian(RoadGrassJoinCompositionSystem manager, Line3.Segment ray, float fovTan)
         {
-            int hit = 0;
+            var renderer = RoadGrassPolygonPrototypeBatchSystem.Instance;
             float nearest = float.MaxValue;
-            foreach (int id in manager.ManualMediansAtNode(Entity.Null))
+            int hit = renderer != null ? renderer.PickClosest(ray, out nearest) : 0;
+            foreach (int id in manager.ManualMedianOutlineIds)
             {
-                var renderer = RoadGrassPolygonPrototypeBatchSystem.Instance;
                 if (renderer?.HasPickGeometry(id) == true)
                 {
-                    if (renderer.TryPick(id, ray, out float score) && score < nearest)
-                    { nearest = score; hit = id; }
                     continue;
                 }
             foreach (var outline in manager.GetManualOutlines(id))
@@ -77,7 +152,7 @@ namespace RoadGrass
             float nearest = float.MaxValue;
             AddManualMedianOutline(ref commands, manager, manager.SelectedManualMedianId, SelectedColor);
             if(source==null&&hasRay)
-                foreach(var candidate in manager.GetNodeAnchors(node))
+                foreach(var candidate in manager.GetNodeAnchors(node, false, m_AnchorCandidates))
                 {
                     if(!manager.HasExtension(candidate)||!manager.TryBuildTaperPreview(candidate,out var outline))continue;
                     bool a=TryScoreFootprint(outline.m_Start.m_Left,outline.m_Start.m_Right,ray,fovTan,out float sa);
@@ -118,13 +193,20 @@ namespace RoadGrass
                 float3 destination = default;
                 bool snapped = false;
                 var points = Options.PolygonSnapping ? new List<float3>(manager.GetTaperSnapPoints(node)) : new List<float3>();
-                if (RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, source, out var opening))
+                bool hasOpening = RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, source, out var opening);
+                if (hasOpening)
                 { if (Options.PolygonSnapping) { points.Insert(0, opening.m_Right.d); points.Insert(0, opening.m_Left.d); } }
+                if (Options.PolygonSnapping)
+                    foreach (var guide in manager.PolygonContourGuides(node))
+                        for (int i = 0; i < 32; i++)
+                        {
+                            float3 a = MathUtils.Position(guide.Curve, i / 32f), b = MathUtils.Position(guide.Curve, (i + 1) / 32f);
+                            if (math.distance(a.xz, opening.m_Left.d.xz) < 65)
+                                AddLine(ref commands, guide.Median ? new Color(.65f,.86f,.53f,.8f) : guide.Marking ? new Color(1,1,1,.4f) : new Color(.8f,.75f,.5f,.3f), new Line3.Segment(a,b), .035f);
+                        }
                 float3 delta = ray.b - ray.a;
                 if (Options.PolygonSnapping)
-                    snapped = PickPolygonSnap(points, ray, hasRay, fovTan, ref commands, out destination);
-                else
-                { m_PolygonSnapTarget = null; m_PolygonHoverGroup = -1; }
+                    snapped = PickPolygonSnap(points, ray, hasRay, fovTan, ref commands, out destination, p => m_PolygonPoints.Count == 0 || manager.PolygonContourEdge(node, m_PolygonPoints[m_PolygonPoints.Count - 1], p) != null);
                 bool closing = false;
                 if (hasRay && m_PolygonCornerStarts.Count >= 3)
                 {
@@ -152,7 +234,8 @@ namespace RoadGrass
                         if (t >= 0 && t <= 1) { destination = ray.a + delta * t; hasPosition = true; }
                     }
                 }
-                var surface = MedianSavedSurface.None;
+                if (Options.PolygonSnapping && !snapped) hasPosition = false;
+                var surface = MedianSavedSurface.Grass;
                 var candidate = new List<float3>(m_PolygonPoints);
                 bool distinct = hasPosition && (candidate.Count == 0 || math.distance(candidate[candidate.Count - 1].xz, destination.xz) >= .1f);
                 if (distinct)
@@ -162,6 +245,10 @@ namespace RoadGrass
                     bool openingEdge = candidate.Count > 0 &&
                         ((candidate[candidate.Count - 1].Equals(opening.m_Left.d) && destination.Equals(opening.m_Right.d)) ||
                          (candidate[candidate.Count - 1].Equals(opening.m_Right.d) && destination.Equals(opening.m_Left.d)));
+                    // Snapping an attachment corner must not drag the extension around
+                    // the original rounded cap. Let the user's next corner set its direction.
+                    bool attachmentEdge = Options.PolygonExtendFromMedian && hasOpening && candidate.Count > 0 &&
+                        RoadGrassLaneGuideResolver.TouchesOpening(candidate[candidate.Count - 1], destination, opening);
                     if (followsGuide && !openingEdge)
                     {
                         var path = manager.PolygonGuideEdge(node, candidate[candidate.Count - 1], destination);
@@ -175,8 +262,16 @@ namespace RoadGrass
                 for (int i = 0; i < candidate.Count; i++)
                 {
                     var p = candidate[i];
-                    Color color = closing && valid ? ValidColor : HoverColor;
-                    AddLine(ref commands, color, new Line3.Segment(p - new float3(.2f,0,0), p + new float3(.2f,0,0)), .4f);
+                    bool straight = snapped && m_PolygonPoints.Count > 0 && manager.PolygonContourEdge(node, m_PolygonPoints[m_PolygonPoints.Count - 1], destination) == null;
+                    Color color = closing && valid ? ValidColor : straight ? new Color(.65f,.7f,.72f,1) : HoverColor;
+                    if (m_PolygonCornerStarts.Contains(i) || i == candidate.Count - 1)
+                        for (int k = 0; k < 12; k++)
+                        {
+                            float a = k * math.PI * 2 / 12, b = (k + 1) * math.PI * 2 / 12;
+                            AddLine(ref commands, i < m_PolygonPoints.Count ? SelectedColor : color,
+                                new Line3.Segment(p + new float3(math.cos(a),0,math.sin(a))*.2f,
+                                    p + new float3(math.cos(b),0,math.sin(b))*.2f), .07f);
+                        }
                     if (i > 0) AddLine(ref commands, color, new Line3.Segment(candidate[i - 1], p), OutlineWidth);
                 }
                 if (candidate.Count >= 3) AddLine(ref commands, closing && valid ? ValidColor : HoverColor,
@@ -192,13 +287,13 @@ namespace RoadGrass
                         int corner = m_PolygonCornerStarts.IndexOf(i);
                         references.Add(corner >= 0 ? m_PolygonCornerSnaps[corner] : Options.PolygonSnapping);
                     }
-                    if (closing && valid && manager.PlacePolygon(source, candidate, surface, references, Options.PolygonExtendFromMedian))
+                    if (closing && valid && manager.PlacePolygon(source, candidate, surface, references, Options.PolygonExtendFromMedian, Options.CrosswalkGaps))
                     {
                         int selected = manager.SelectedManualMedianId;
                         Options.SetActiveMode((int)MedianControllerMode.Edit);
                         manager.SelectManualMedian(selected);
                     }
-                    else if (!closing && distinct && m_PolygonCornerStarts.Count < 32 && candidate.Count <= 128)
+                    else if (!closing && distinct)
                     {
                         m_PolygonCornerStarts.Add(m_PolygonPoints.Count); m_PolygonCornerSnaps.Add(snapped);
                         m_PolygonPoints.Clear(); m_PolygonPoints.AddRange(candidate);

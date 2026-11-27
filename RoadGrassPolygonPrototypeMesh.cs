@@ -17,12 +17,39 @@ namespace RoadGrass
             internal float2 Insets, CurbU;
             internal float CurbWidth, Height, GrassHeight, BaseHeight, TextureScale, TopInset, CurbV, AttachmentWidth;
             internal List<CurbVertex> Section;
+            internal float2 PavementU, PavementScale;
+            internal float TerrainScale;
+            internal float InteriorTiling;
+            internal Entity PavementPiece, CurbPiece;
+            internal int PavementMaterial, CurbMaterial;
         }
 
         internal struct CurbVertex
         {
             internal float Depth, Height;
             internal float2 UV;
+        }
+
+        internal static Profile WithPavementFill(Profile curb, Profile fill)
+        {
+            curb.PavementU = fill.PavementU; curb.PavementScale = fill.PavementScale;
+            curb.PavementPiece = fill.PavementPiece; curb.PavementMaterial = fill.PavementMaterial;
+            return curb;
+        }
+
+        internal static bool HasPhysicalPieces(RoadGrassResolvedMedianAnchor source) => source.Pieces.Exists(IsPhysicalPiece);
+        private static bool IsPhysicalPiece(NetCompositionPiece piece) =>
+            (piece.m_PieceFlags & NetPieceFlags.HasMesh) != 0 &&
+            (piece.m_PieceFlags & (NetPieceFlags.PreserveShape | NetPieceFlags.BlockTraffic | NetPieceFlags.BlockCrosswalk)) != 0;
+        internal static bool IncludePiece(NetCompositionPiece piece, bool physical) =>
+            (!physical || IsPhysicalPiece(piece)) && (piece.m_PieceFlags & NetPieceFlags.Bottom) == 0 &&
+            (piece.m_SectionFlags & (NetSectionFlags.Hidden | NetSectionFlags.Underground | NetSectionFlags.Overhead)) == 0;
+
+        private struct TopFace
+        {
+            internal float Low, High, Height, OuterU, InnerU, VScale;
+            internal Entity Piece;
+            internal int Material;
         }
 
         internal static Profile ReadProfile(EntityManager manager, PrefabSystem prefabs, RoadGrassResolvedMedianAnchor source)
@@ -36,13 +63,14 @@ namespace RoadGrass
             var sectionPoints = new List<float4>(); // lateral position, height, longitudinal position, lateral normal
             var sectionUV = new List<float2>();
             var surfaceLevels = new List<float>();
+            var faces = new List<TopFace>();
+            bool physical = HasPhysicalPieces(source);
             float low = float.MaxValue, high = float.MinValue, top = float.MinValue;
             float grassLow = float.MaxValue, grassHigh = float.MinValue;
             float grassTop = float.MinValue;
             foreach (var piece in source.Pieces)
             {
-                if ((piece.m_PieceFlags & NetPieceFlags.Bottom) != 0 ||
-                    (piece.m_SectionFlags & (NetSectionFlags.Hidden | NetSectionFlags.Underground | NetSectionFlags.Overhead)) != 0) continue;
+                if (!IncludePiece(piece, physical)) continue;
                 if (manager.HasComponent<NetPieceData>(piece.m_Piece))
                 {
                     float height = manager.GetComponentData<NetPieceData>(piece.m_Piece).m_HeightRange.max + piece.m_Offset.y;
@@ -66,8 +94,30 @@ namespace RoadGrass
                             if (surface == null) continue;
                             bool isGrass = surface.name.IndexOf("grass", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 surface.name.IndexOf("lawn", StringComparison.OrdinalIgnoreCase) >= 0;
+                            var indices = mesh.GetIndices(subMesh);
+                            if (!isGrass)
+                            for (int t = 0; t + 2 < indices.Length; t += 3)
+                            {
+                                int a = indices[t], b = indices[t + 1], c = indices[t + 2];
+                                if ((uint)a >= uv.Count || (uint)b >= uv.Count || (uint)c >= uv.Count ||
+                                    (uint)a >= normals.Length || (uint)b >= normals.Length || (uint)c >= normals.Length ||
+                                    normals[a].y < .9f || normals[b].y < .9f || normals[c].y < .9f) continue;
+                                float3 pa = vertices[a], pb = vertices[b], pc = vertices[c];
+                                if (math.abs(pa.y - pb.y) > .001f || math.abs(pa.y - pc.y) > .001f) continue;
+                                float X(float3 p) => (inverted ? p.x : -p.x) + piece.m_Offset.x;
+                                float xa = X(pa), xb = X(pb), xc = X(pc);
+                                float lo = math.min(xa, math.min(xb, xc)), hi = math.max(xa, math.max(xb, xc));
+                                if (hi - lo < .001f || lo < -source.Width * .5f - .5f || hi > source.Width * .5f + .5f) continue;
+                                int left = xa <= xb && xa <= xc ? a : xb <= xc ? b : c;
+                                int right = xa >= xb && xa >= xc ? a : xb >= xc ? b : c;
+                                float zSpan = math.max(pa.z, math.max(pb.z, pc.z)) - math.min(pa.z, math.min(pb.z, pc.z));
+                                float vSpan = math.max(uv[a].y, math.max(uv[b].y, uv[c].y)) - math.min(uv[a].y, math.min(uv[b].y, uv[c].y));
+                                faces.Add(new TopFace { Low = lo, High = hi, Height = pa.y + piece.m_Offset.y,
+                                    OuterU = uv[left].x, InnerU = uv[right].x, VScale = zSpan > .001f ? vSpan / zSpan : 0,
+                                    Piece = piece.m_Piece, Material = material });
+                            }
                             var visited = new HashSet<int>();
-                            foreach (int index in mesh.GetIndices(subMesh))
+                            foreach (int index in indices)
                             {
                                 if ((uint)index >= vertices.Length || (uint)index >= uv.Count || !visited.Add(index)) continue;
                                 float3 p = vertices[index];
@@ -181,8 +231,35 @@ namespace RoadGrass
                     result.CurbWidth = math.max(shoulder.Depth + .01f, nativeWidth);
                 }
             }
+            return SelectSurfaceFaces(result, faces, low, top);
+        }
+
+        private static Profile SelectSurfaceFaces(Profile result, List<TopFace> faces, float low, float top)
+        {
+            // Select connected crown faces, not coincident UV vertices from the pavement/apron.
+            float fillWidth = 0, curbError = float.MaxValue;
+            foreach (var face in faces)
+            {
+                if (face.Height < top - .01f) continue;
+                float width = face.High - face.Low;
+                if (width > result.CurbWidth * 1.5f && width > fillWidth)
+                {
+                    fillWidth = width;
+                    result.PavementU = new float2(math.min(face.OuterU, face.InnerU), math.max(face.OuterU, face.InnerU));
+                    result.PavementScale = new float2(1 / width, face.VScale);
+                    result.PavementPiece = face.Piece; result.PavementMaterial = face.Material;
+                }
+                float error = math.abs(face.Low - low);
+                if (width <= result.CurbWidth * 1.5f && error < curbError)
+                {
+                    curbError = error;
+                    result.CurbU = new float2(face.OuterU, face.InnerU);
+                    result.CurbPiece = face.Piece; result.CurbMaterial = face.Material;
+                }
+            }
             return result;
         }
+        internal static float2 MapPavement(float3 point, float3 origin) => (point - origin).xz;
 
         internal static Mesh Build(IReadOnlyList<RoadGrassPolygonShape.Loop> loops, float3 origin,
             Profile profile, Func<float3, float3> project, bool useGrass)
@@ -218,19 +295,19 @@ namespace RoadGrass
                     if (profile.AttachmentWidth <= 0) return;
                     for (int i = 0; i < loop.Points.Count; i++)
                     {
-                        if (!loop.Opening[i]) continue;
+                        if (!loop.Opening[i] || RoadGrassPolygonShape.IsBridge(loop,i)) continue;
                         RoadGrassPolygonShape.PinOpening(contour, loop.Points[i], loop.Points[(i + 1) % loop.Points.Count],
                             profile.AttachmentWidth, new float2(inset));
                         break;
                     }
                 }
-                if (!useGrass || interiors.Count == 0)
+                if (interiors.Count == 0)
                 {
-                    foreach (var surface in tops) Fill(surface.Points, pavement, 0);
+                    foreach (var surface in tops) Fill(surface.Points, useGrass ? pavement : grass, 0, !useGrass);
                 }
                 else
                 {
-                    // Doubled bridges cancel under even-odd filling; pavement has holes for grass.
+                    // Doubled bridges cancel under even-odd filling; the curb ring excludes the fill.
                     var ring = new List<float3>();
                     foreach (var surface in tops)
                     {
@@ -243,7 +320,8 @@ namespace RoadGrass
                         ring.AddRange(inner.Points);
                         ring.Add(inner.Points[0]);
                         ring.Add(loop.Points[0]);
-                        Fill(inner.Points, grass, profile.GrassHeight - height);
+                        Fill(inner.Points, grass,
+                            useGrass ? profile.GrassHeight - height : 0, !useGrass);
                     }
                     if (tops.Count == 1 && interiors.Count == 1 &&
                         tops[0].Points.Count == loop.Points.Count && interiors[0].Points.Count == loop.Points.Count)
@@ -334,23 +412,31 @@ namespace RoadGrass
             }
             catch { UnityEngine.Object.Destroy(mesh); throw; }
 
-            void Fill(IReadOnlyList<float3> points, List<int> indices, float lift)
+            void Fill(IReadOnlyList<float3> points, List<int> indices, float lift, bool planar = false)
             {
                 if (!RoadGrassPolygonSections.TryBuild(points, out var sections, out var reason,
-                    maxPoints: math.max(128, points.Count), maxSections: 2048))
+                    maxPoints: points.Count, maxSections: int.MaxValue))
                     throw new InvalidOperationException(reason);
                 foreach (var section in sections)
                 {
                     float3 elevation = new float3(0, height + lift, 0);
                     int rows = math.max(Samples(section.Left.a, section.Left.d), Samples(section.Right.a, section.Right.d));
                     int columns = math.max(Samples(section.Left.a, section.Right.a), Samples(section.Left.d, section.Right.d));
+                    var grid = new float3[(rows + 1) * (columns + 1)];
+                    for (int row = 0; row <= rows; row++)
+                    for (int column = 0; column <= columns; column++)
+                        grid[row * (columns + 1) + column] = project(math.lerp(
+                            math.lerp(section.Left.a, section.Left.d, row / (float)rows),
+                            math.lerp(section.Right.a, section.Right.d, row / (float)rows), column / (float)columns)) + elevation;
                     for (int row = 0; row < rows; row++)
                     for (int column = 0; column < columns; column++)
                     {
-                        float3 At(int x, int y) => project(math.lerp(
-                            math.lerp(section.Left.a, section.Left.d, y / (float)rows),
-                            math.lerp(section.Right.a, section.Right.d, y / (float)rows), x / (float)columns)) + elevation;
-                        Quad(At(column, row), At(column + 1, row), At(column + 1, row + 1), At(column, row + 1), indices, true);
+                        float3 At(int x, int y) => grid[y * (columns + 1) + x];
+                        float3 a = At(column, row), b = At(column + 1, row), c = At(column + 1, row + 1), d = At(column, row + 1);
+                        if (planar) Quad(a, b, c, d, indices, true, MapPavement(a, origin) * profile.PavementScale,
+                            MapPavement(b, origin) * profile.PavementScale, MapPavement(c, origin) * profile.PavementScale,
+                            MapPavement(d, origin) * profile.PavementScale);
+                        else Quad(a, b, c, d, indices, true);
                     }
                 }
             }
@@ -361,15 +447,15 @@ namespace RoadGrass
                 float2? uvA = null, float2? uvB = null, float2? uvC = null, float2? uvD = null)
             {
                 int first = vertices.Count;
-                int corner = 0;
-                var explicitUV = new[] { uvA, uvB, uvC, uvD };
-                foreach (var point in new[] { a, b, c, d })
+                Vertex(a, uvA); Vertex(b, uvB); Vertex(c, uvC); Vertex(d, uvD);
+                Triangle(0,1,2); Triangle(0,2,3);
+                void Vertex(float3 point, float2? mapped)
                 {
                     if (!math.all(math.isfinite(point))) throw new InvalidOperationException("Polygon mesh contains a non-finite vertex");
                     vertices.Add((Vector3)(point - origin));
-                    var mapped = explicitUV[corner++];
-                    if (mapped.HasValue) uv.Add(mapped.Value);
-                    else if (indices != pavement) uv.Add(new Vector2(point.x, point.z));
+                    float tiling = profile.InteriorTiling > 0 ? profile.InteriorTiling : 1;
+                    if (mapped.HasValue) uv.Add(mapped.Value * (indices != pavement ? tiling : 1));
+                    else if (indices != pavement) uv.Add(new Vector2(point.x, point.z) * (profile.TerrainScale > 0 ? profile.TerrainScale : 1) * tiling);
                     else
                     {
                     float best = float.MaxValue, along = 0, perimeter = 0;
@@ -387,7 +473,6 @@ namespace RoadGrass
                         profile.CurbV + along * textureScale));
                     }
                 }
-                Triangle(0,1,2); Triangle(0,2,3);
                 void Triangle(int x, int y, int z)
                 {
                     float3 normal = math.cross((float3)vertices[first+y] - (float3)vertices[first+x], (float3)vertices[first+z] - (float3)vertices[first+x]);
@@ -397,7 +482,8 @@ namespace RoadGrass
                     if (top)
                     {
                         if (reverse) normal = -normal;
-                        foreach (int i in new[] { first+x, first+y, first+z })
+                        AddNormal(first+x); AddNormal(first+y); AddNormal(first+z);
+                        void AddNormal(int i)
                         {
                             topVertices.Add(i);
                             topNormals.TryGetValue(vertices[i], out var previous);

@@ -16,6 +16,8 @@
 	<Import Project="$(CSII_TOOLPATH)\Mod.targets" />
 
 	<ItemGroup>
+		<EmbeddedResource Include="UI\TextureImporter.html" LogicalName="RoadGrass.TextureImporter.html" Type="Non-Resx" WithCulture="false" />
+		<EmbeddedResource Include="UI\src\icons\tool.svg" LogicalName="RoadGrass.ToolIcon.svg" Type="Non-Resx" WithCulture="false" />
 		<Reference Include="Game">
 			<Private>false</Private>
 		</Reference>
@@ -45,6 +47,13 @@
 		</Reference>
 		<Reference Include="UnityEngine.CoreModule">
 			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.JSONSerializeModule">
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.ImageConversionModule">
+			<HintPath>$(ManagedPath)\UnityEngine.ImageConversionModule.dll</HintPath>
+			<Private>False</Private>
 		</Reference>
 		<Reference Include="Unity.RenderPipelines.HighDefinition.Runtime">
 			<Private>false</Private>

@@ -15,7 +15,6 @@ namespace RoadGrass
         private readonly Dictionary<Entity, List<RoadGrassResolvedMedianAnchor>> m_SegmentAnchors = new();
         private readonly Dictionary<(Entity, int, Entity, MedianSavedSurface), EndpointStylePlan> m_SegmentPlans = new();
         private bool m_SegmentSurfacesLoaded;
-        private bool m_PendingSegmentSurfaces;
 
         private Entity GetOriginalSegment(Entity edge)
         {
@@ -36,7 +35,7 @@ namespace RoadGrass
                 !RoadGrassMedianAnchorResolver.TryResolveAll(EntityManager, edge, false,
                     GetBufferLookup<NetSubSection>(true), GetBufferLookup<NetSectionPiece>(true),
                     GetComponentLookup<NetPieceData>(true), GetComponentLookup<NetVertexMatchData>(true),
-                    out var anchors, data.m_Flags)) return new List<RoadGrassResolvedMedianAnchor>();
+                    out var anchors, out _, data.m_Flags)) return new List<RoadGrassResolvedMedianAnchor>();
             var pieces = EntityManager.GetBuffer<NetCompositionPiece>(source, true);
             // A center divider must have road lanes on both sides. This excludes
             // outer verges even on generated prefabs without Median section flags.
@@ -118,13 +117,17 @@ namespace RoadGrass
         }
 
         internal bool CanEditSegmentSurface(RoadGrassResolvedMedianAnchor anchor, MedianSurfaceChoice choice) =>
-            (uint)choice <= 1 && !m_CityQuery.IsEmptyIgnoreFilter && TryPlanSegment(anchor,
-                choice == MedianSurfaceChoice.Grass ? MedianSavedSurface.Grass : MedianSavedSurface.Plain, out _);
+            ((uint)choice <= 1 || (RoadGrassTerrainTextures.IsChoice((int)choice) &&
+                RoadGrassTerrainTextures.TryGet((PolygonTerrainLayer)((int)choice-10), out _, out _))) &&
+            !m_CityQuery.IsEmptyIgnoreFilter && TryPlanSegment(anchor,
+                choice == MedianSurfaceChoice.Plain ? MedianSavedSurface.Plain : MedianSavedSurface.Grass, out _);
 
         internal bool TryEditSegmentSurface(RoadGrassResolvedMedianAnchor anchor, MedianSurfaceChoice choice)
         {
             if (!CanEditSegmentSurface(anchor, choice)) return false;
-            StoreSegmentSurface(anchor, choice == MedianSurfaceChoice.Grass ? MedianSavedSurface.Grass : MedianSavedSurface.Plain);
+            StoreSegmentSurface(anchor, choice == MedianSurfaceChoice.Plain ? MedianSavedSurface.Plain : MedianSavedSurface.Grass,
+                (int)choice >= 11 ? (PolygonTerrainLayer)((int)choice-10) : PolygonTerrainLayer.None,
+                World.GetExistingSystemManaged<RoadGrassUISystem>()?.EditTextureTiling ?? 1);
             return true;
         }
 
@@ -153,14 +156,15 @@ namespace RoadGrass
             return true;
         }
 
-        private void StoreSegmentSurface(RoadGrassResolvedMedianAnchor anchor, MedianSavedSurface surface)
+        private void StoreSegmentSurface(RoadGrassResolvedMedianAnchor anchor, MedianSavedSurface surface, PolygonTerrainLayer terrain = PolygonTerrainLayer.None, float textureTiling = 1)
         {
             var identity = anchor.Data;
             identity.End = false;
             if (TryGetSegmentAnchor(anchor.Key.Edge, anchor.Key.Ordinal, out var segment)) identity = segment.Data;
-            var record = new RoadGrassSavedSegmentSurface { Edge = anchor.Key.Edge, Median = identity, Surface = surface };
+            var record = new RoadGrassSavedSegmentSurface { Edge = anchor.Key.Edge, Median = identity, Surface = surface, TerrainLayer = terrain,
+                TextureTiling = terrain != PolygonTerrainLayer.None && math.isfinite(textureTiling) ? math.clamp(textureTiling, .25f, 4) : 0 };
             if (m_SegmentSurfaces.TryGetValue(record.Key, out var current)
-                ? current.Surface == surface && current.Median.Equals(identity)
+                ? current.Surface == surface && current.TerrainLayer == terrain && current.EffectiveTextureTiling == record.EffectiveTextureTiling && current.Median.Equals(identity)
                 : surface == MedianSavedSurface.None) return;
             InvalidateTransitions(anchor.Key.Edge);
             if (surface == MedianSavedSurface.None) m_SegmentSurfaces.Remove(record.Key);
@@ -171,7 +175,7 @@ namespace RoadGrass
                     if (records[i].Key.Equals(record.Key)) records.RemoveAt(i);
                 if (surface != MedianSavedSurface.None) records.Add(record);
             }
-            m_Dirty = true;
+            QueueMedianEdit(record.Edge);
         }
 
         private void HydrateSegmentSurfaces()
@@ -211,19 +215,16 @@ namespace RoadGrass
             }
         }
 
-        private void SynchronizeSegmentMeshes()
+        private void SynchronizeSegmentMeshes(HashSet<Entity> edges = null)
         {
             var desired = new Dictionary<Entity, List<EndpointStylePlan>>();
-            m_PendingSegmentSurfaces = false;
-            foreach (var style in m_Styles.Values)
-                m_PendingSegmentSurfaces |= style.Surface != MedianSavedSurface.None;
             foreach (var record in new List<RoadGrassSavedSegmentSurface>(m_SegmentSurfaces.Values))
             {
-                if (EntityManager.Exists(record.Edge) && EntityManager.HasComponent<Deleted>(record.Edge))
+                if (edges != null && !edges.Contains(record.Edge)) continue;
+                if (IsParentRoadDeleted(record.Edge))
                 { RemoveSegmentRecords(record.Edge); continue; }
                 var anchors = GetSegmentAnchors(record.Edge);
-                if (anchors.Count == 0)
-                { m_PendingSegmentSurfaces = true; continue; }
+                if (anchors.Count == 0) continue;
                 // Never silently move a persisted override to a different divider.
                 // Reuse the saved-anchor rematcher for regenerated Road Builder
                 // prefabs, then require the same ordinal and physical interval.
@@ -236,7 +237,7 @@ namespace RoadGrass
                 plans.Add(plan);
             }
             foreach (var edge in new List<Entity>(m_SegmentMeshes.Keys))
-                if (!desired.ContainsKey(edge)) RestoreSegmentMesh(edge);
+                if ((edges == null || edges.Contains(edge)) && !desired.ContainsKey(edge)) RestoreSegmentMesh(edge);
             foreach (var entry in desired)
             {
                 var source = entry.Value[0].Source;

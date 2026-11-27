@@ -11,12 +11,14 @@ namespace RoadGrass
 {
     internal partial class RoadGrassJoinCompositionSystem
     {
+        private readonly Dictionary<Entity, RoadGrassContourGraph> m_ContourGraphs = new();
         private readonly Dictionary<Entity, List<float3>> m_TaperSnapPoints = new();
         private readonly Dictionary<Entity, IEnumerator<bool>> m_TaperSnapBuilders = new();
 
         private void AdvanceSnapPoints(Entity node)
         {
             if (!m_TaperSnapBuilders.TryGetValue(node, out var builder)) return;
+            int previousCount = m_TaperSnapPoints[node].Count;
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             do
             {
@@ -24,6 +26,7 @@ namespace RoadGrass
                 builder.Dispose(); m_TaperSnapBuilders.Remove(node); break;
             }
             while ((System.Diagnostics.Stopwatch.GetTimestamp() - start) * 1000d / System.Diagnostics.Stopwatch.Frequency < 1);
+            if (m_TaperSnapPoints[node].Count != previousCount) m_PolygonGuideEdges.Clear();
         }
         private readonly Dictionary<Entity, List<RoadGrassTaperGeometry.Lane>> m_MarkingGuides = new();
 
@@ -47,18 +50,25 @@ namespace RoadGrass
                 foreach (var sub in EntityManager.GetBuffer<Game.Net.SubLane>(owner, true))
                 {
                     Entity lane = sub.m_SubLane;
-                    if (!seen.Add(lane) || EntityManager.HasComponent<Deleted>(lane) || EntityManager.HasComponent<Game.Tools.Temp>(lane)) continue;
+                    if (!seen.Add(lane) || !EntityManager.HasComponent<Game.Net.SecondaryLane>(lane) || EntityManager.HasComponent<Game.Tools.Hidden>(lane) || EntityManager.HasComponent<Deleted>(lane) || EntityManager.HasComponent<Game.Tools.Temp>(lane)) continue;
                     TrackTaperDependency(lane);
                     if (!EntityManager.TryGetComponent(lane, out Game.Net.Curve curve) ||
                         !EntityManager.TryGetComponent(lane, out PrefabRef prefab) ||
-                        !prefabs.TryGetPrefab<NetLaneGeometryPrefab>(prefab, out var geometry) || geometry == null || geometry.m_Meshes == null) continue;
+                        !prefabs.TryGetPrefab<NetLaneGeometryPrefab>(prefab, out var geometry) || geometry == null || geometry.m_Meshes == null || !System.Text.RegularExpressions.Regex.IsMatch(geometry.name, @"\b(edge|lane|merge|center) line\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) continue;
                     foreach (var mesh in geometry.m_Meshes)
                     {
                         if (mesh?.m_Mesh == null || mesh.m_RequireEditor ||
                             !mesh.m_Mesh.TryGet<DecalProperties>(out var decal) ||
                             (decal.m_LayerMask & Game.Rendering.DecalLayers.Roads) == 0) continue;
                         // Native marking centerlines, not texture pixels or arrow outlines.
-                        guides.Add(new RoadGrassTaperGeometry.Lane { Curve = curve.m_Bezier, Width = 0 });
+                        float from = 0;
+                        if (EntityManager.HasBuffer<Game.Net.CutRange>(lane))
+                            foreach (var cut in EntityManager.GetBuffer<Game.Net.CutRange>(lane, true))
+                            {
+                                if (cut.m_CurveDelta.min > from) guides.Add(new RoadGrassTaperGeometry.Lane { Marking = true, Curve = MathUtils.Cut(curve.m_Bezier, new Bounds1(from, cut.m_CurveDelta.min)) });
+                                from = math.max(from, cut.m_CurveDelta.max);
+                            }
+                        if (from < 1) guides.Add(new RoadGrassTaperGeometry.Lane { Curve = MathUtils.Cut(curve.m_Bezier, new Bounds1(from, 1)) });
                         break;
                     }
                 }
@@ -122,7 +132,7 @@ namespace RoadGrass
                 Surface=MedianSavedSurface.None,ExtendIntoIntersection=true,HasTaperEnd=true,
                 TaperEndOffset=destination-node.m_Position
             });
-            StoreSegmentSurface(GetSegmentForEndpoint(anchor),surface==MedianSurfaceChoice.Grass?MedianSavedSurface.Grass:MedianSavedSurface.Plain);
+            TryEditSegmentSurface(GetSegmentForEndpoint(anchor),surface);
             return true;
         }
 
@@ -155,98 +165,16 @@ namespace RoadGrass
         internal List<float3> GetTaperSnapPoints(Entity node)
         {
             if (m_TaperSnapPoints.TryGetValue(node,out var points)) { AdvanceSnapPoints(node); return points; }
-            points = new List<float3>();
-            m_TaperSnapPoints[node]=points;
+            var graph = new RoadGrassContourGraph(PolygonContourGuides(node));
+            foreach (var anchor in GetNodeAnchors(node))
+                if (RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, anchor, out var approach))
+                    graph.ExtraPoints.Add((approach.m_Left.d + approach.m_Right.d) * .5f);
+            m_ContourGraphs[node] = graph; points = graph.Points; m_TaperSnapPoints[node] = points;
             TrackTaperDependency(node);
-            if (!EntityManager.HasBuffer<Game.Net.SubLane>(node)) return points;
-            var lines = new List<Line3.Segment>();
-            var guides = new List<int>();
-            int guide = 0;
-            foreach (var entry in EntityManager.GetBuffer<Game.Net.SubLane>(node,true))
-            {
-                Entity lane=entry.m_SubLane;
-                TrackTaperDependency(lane);
-                if (EntityManager.HasComponent<Deleted>(lane) || !EntityManager.HasComponent<Game.Net.CarLane>(lane) ||
-                    !EntityManager.TryGetComponent(lane,out Game.Net.Curve curve) ||
-                    !EntityManager.TryGetComponent(lane,out PrefabRef prefab) ||
-                    !EntityManager.TryGetComponent(prefab.m_Prefab,out NetLaneData data)) continue;
-                for (int side=-1;side<=1;side+=2)
-                {
-                    guide++;
-                    float3 previous=default;
-                    for (int i=0;i<=24;i++)
-                    {
-                        float t=i/24f;
-                        float3 p=MathUtils.Position(curve.m_Bezier,t);
-                        float2 tangent=math.normalizesafe(MathUtils.Tangent(curve.m_Bezier,t).xz);
-                        p.xz+=new float2(-tangent.y,tangent.x)*(side*data.m_Width*0.5f);
-                        if (i==0 || i==24) AddPoint(p);
-                        if (i>0) { lines.Add(new Line3.Segment(previous,p)); guides.Add(guide); }
-                        previous=p;
-                    }
-                }
-            }
-            int firstMarkingGuide = guide + 1;
-            if (EntityManager.TryGetComponent(node, out Node nodeData))
-            {
-                float radius = 8;
-                foreach (var p in points) radius = math.max(radius, math.distance(p.xz, nodeData.m_Position.xz) + 2);
-                foreach (var marking in GetMarkingGuides(node))
-                {
-                    guide++;
-                    float3 previous = marking.Curve.a;
-                    for (int i = 1; i <= 64; i++)
-                    {
-                        float3 p = MathUtils.Position(marking.Curve, i / 64f);
-                        float2 delta = p.xz - previous.xz;
-                        float t = math.saturate(math.dot(nodeData.m_Position.xz - previous.xz, delta) / math.max(.0001f, math.lengthsq(delta)));
-                        if (math.distance(math.lerp(previous.xz, p.xz, t), nodeData.m_Position.xz) <= radius)
-                        {
-                            lines.Add(new Line3.Segment(previous, p));
-                            guides.Add(guide);
-                        }
-                        previous = p;
-                    }
-                }
-            }
-            // Spatial candidates avoid comparing distant samples; remaining work is frame-budgeted.
-            m_TaperSnapBuilders[node] = FindIntersections();
+            if (!EntityManager.TryGetComponent(node, out Node data)) return points;
+            m_TaperSnapBuilders[node] = graph.Build(data.m_Position);
             AdvanceSnapPoints(node);
             return points;
-            IEnumerator<bool> FindIntersections()
-            {
-                int work = 0;
-            foreach (var pair in RoadGrassSnapCandidates.Pairs(lines))
-            {
-                int i = pair.x, j = pair.y;
-                if ((++work & 63) == 0) yield return true;
-                if (guides[i] == guides[j]) continue;
-                bool marking = guides[i] >= firstMarkingGuide || guides[j] >= firstMarkingGuide;
-                var a=lines[i];var b=lines[j];
-                if (math.any(math.max(a.a.xz,a.b.xz)<math.min(b.a.xz,b.b.xz)) ||
-                    math.any(math.max(b.a.xz,b.b.xz)<math.min(a.a.xz,a.b.xz))) continue;
-                float2 u=a.b.xz-a.a.xz,v=b.b.xz-b.a.xz,w=b.a.xz-a.a.xz;
-                float determinant=u.x*v.y-u.y*v.x;
-                // Parallel/overlapping guides are not lane crossings. Adjacent samples
-                // on one guide must never become snap points.
-                if (math.abs(determinant)<math.max(0.000001f,math.length(u)*math.length(v)*.0001f)) continue;
-                float t=(w.x*v.y-w.y*v.x)/determinant, s=(w.x*u.y-w.y*u.x)/determinant;
-                if(t>=0&&t<=1&&s>=0&&s<=1)
-                {
-                    float3 p = math.lerp(a.a,a.b,t), q = math.lerp(b.a,b.b,s);
-                    // Lane envelopes use the junction's projected geometry; their heights
-                    // can differ on the same road. Preserve those original snap points.
-                    if (!marking) AddPoint(p);
-                    else if (math.abs(p.y-q.y) <= .5f) AddPoint((p+q)*.5f);
-                }
-            }
-            }
-            void AddPoint(float3 p)
-            {
-                if(!math.all(math.isfinite(p)))return;
-                foreach(var old in points)if(math.distancesq(old,p)<.0001f)return;
-                points.Add(p);
-            }
         }
     }
 }

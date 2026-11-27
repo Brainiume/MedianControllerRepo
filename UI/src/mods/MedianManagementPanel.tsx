@@ -1,44 +1,16 @@
 import { bindValue, trigger, useValue } from "cs2/api";
 import { useLocalization } from "cs2/l10n";
 import { useLayoutEffect, useRef, useState } from "react";
-import { getModule } from "cs2/modding";
 import mod from "../../mod.json";
 import { VanillaComponentResolver } from "./VanillaComponentResolver";
-import grass from "../icons/grass.svg";
-import plain from "../icons/plain.svg";
-import reset from "../icons/all.svg";
+import { MedianSurfaceDropdown } from "./MedianSurfaceDropdown";
+import { MedianPropertySlider as Slider } from "./MedianPropertySlider";
 import connect from "../icons/connect.svg";
 import resetCurb from "../icons/reset-curb.svg";
 import resetShape from "../icons/reset-shape.svg";
-
-const sectionStyle = getModule(
-    "game-ui/game/components/tool-options/mouse-tool-options/mouse-tool-options.module.scss", "classes"
-);
-const buttonStyle = getModule(
-    "game-ui/game/components/tool-options/tool-button/tool-button.module.scss", "classes"
-);
-const propertiesStyle = `
-    .median-controller-properties { display: flex; flex-direction: column; font-family: Overpass; }
-    .median-controller-properties > * { flex-shrink: 0; margin-top: 4rem; }
-    .median-controller-properties > :first-child { margin-top: 0; }
-    .median-controller-properties-title { font-size: 16rem; line-height: 21rem; }
-    .median-controller-properties .${buttonStyle.button} { width: 28rem; height: 28rem; border-radius: 4rem; }
-    .median-controller-properties .${sectionStyle.item} { min-height: 39rem; padding: 0; }
-    .median-controller-properties .${sectionStyle.label} { flex: 0 0 132rem; width: 132rem; margin-right: 18rem; font-size: 16rem; font-weight: 700; line-height: 21rem; }
-    .median-controller-properties .${sectionStyle.content} { justify-content: flex-start; margin-left: 0; }
-    .median-controller-properties .${sectionStyle.content} > * { margin-left: 0; margin-right: 8rem; }
-    .median-controller-properties .${sectionStyle.content} > :last-child { margin-right: 0; }
-    .median-controller-properties-fields { display: flex; flex-direction: column; }
-    .median-controller-properties-field { display: flex; flex-direction: column; height: 48rem; margin-top: 4rem; }
-    .median-controller-properties-field:first-child { margin-top: 0; }
-    .median-controller-properties-caption { display: flex; flex-direction: row; justify-content: space-between; height: 22rem; margin-bottom: 6rem; font-size: 14rem; line-height: 20rem; }
-    .median-controller-properties-field > :last-child { height: 12rem; }
-    .median-controller-properties-footer { display: flex; flex-direction: row; align-items: center; height: 38rem; margin-top: 4rem; }
-    .median-controller-properties-footer > * { margin-right: 14rem; }
-`;
+import editPolygon from "../icons/polygon.svg";
 
 const selected$ = bindValue<number>(mod.id, "SelectedManualMedianId");
-const surface$ = bindValue<number>(mod.id, "SelectedManualMedianSurface");
 const editable$ = bindValue<boolean>(mod.id, "CanEditSelectedManualMedian");
 const message$ = bindValue<string>(mod.id, "ManualMedianMessage");
 const polygon$ = bindValue<boolean>(mod.id, "SelectedIsPolygon");
@@ -49,97 +21,124 @@ const lineRadius$ = bindValue<number>(mod.id, "PolygonLineRadius");
 const medianRadius$ = bindValue<number>(mod.id, "PolygonMedianRadius");
 const offsetLimit$ = bindValue<number>(mod.id, "PolygonOffsetLimit");
 const polygonExtend$ = bindValue<boolean>(mod.id, "PolygonExtendFromMedian");
+const crosswalkGaps$ = bindValue<boolean>(mod.id, "CrosswalkGaps");
+const crosswalkGapsAvailable$ = bindValue<boolean>(mod.id, "CrosswalkGapsAvailable");
 const curbWidth$ = bindValue<number>(mod.id, "PolygonCurbWidth");
+const textureTiling$ = bindValue<number>(mod.id, "PolygonTextureTiling");
+const pointEditing$ = bindValue<boolean>(mod.id, "PolygonPointEditing");
+const texture$ = bindValue<number>(mod.id, "SelectedMedianTexture");
 
 export const MedianManagementPanel = () => {
-    const selected = useValue(selected$), surface = useValue(surface$);
+    const selected = useValue(selected$);
     const editable = useValue(editable$), message = useValue(message$);
     const polygon = useValue(polygon$), opening = useValue(opening$);
     const values = [useValue(lineOffset$), useValue(medianOffset$), useValue(lineRadius$), useValue(medianRadius$)];
     const offsetLimit = useValue(offsetLimit$);
     const polygonExtend = useValue(polygonExtend$);
+    const crosswalkGaps = useValue(crosswalkGaps$);
+    const crosswalkGapsAvailable = useValue(crosswalkGapsAvailable$);
     const curbWidth = useValue(curbWidth$);
+    const textureTiling = useValue(textureTiling$);
+    const pointEditing = useValue(pointEditing$);
+    const texture = useValue(texture$);
     const { translate } = useLocalization();
-    const { Section, ToolButton, toolButtonTheme, FOCUS_DISABLED, Slider, sliderTheme } = VanillaComponentResolver.instance;
-    const panel = useRef<HTMLElement>(null);
-    const [position, setPosition] = useState({left: 0, bottom: 0});
+    const { Section, ToolButton, toolButtonTheme, toolOptionsPanelTheme, FOCUS_DISABLED, Panel, Portal, PanelTitleBar, InfoSection, InfoSectionFoldout, InfoRow, Checkbox, Tooltip } = VanillaComponentResolver.instance;
+    const anchor = useRef<HTMLSpanElement>(null);
+    const [position, setPosition] = useState({left: 0, bottom: 0, width: 0});
     useLayoutEffect(() => {
+        const options = anchor.current?.closest(`.${toolOptionsPanelTheme.toolOptionsPanel}`);
+        if (!options) return;
         const place = () => {
-            const options = panel.current?.closest(".median-controller-options")?.parentElement;
-            if (!options) return;
             const bounds = options.getBoundingClientRect();
-            setPosition({left: bounds.left, bottom: window.innerHeight - bounds.top + (polygon ? 0 : 12)});
+            setPosition({left: bounds.left, bottom: window.innerHeight - bounds.top, width: bounds.width});
         };
         place();
+        const observer = typeof ResizeObserver === "function" ? new ResizeObserver(place) : undefined;
+        observer?.observe(options);
+        options.addEventListener("transitionend", place);
         window.addEventListener("resize", place);
-        return () => window.removeEventListener("resize", place);
+        return () => { observer?.disconnect(); options.removeEventListener("transitionend", place); window.removeEventListener("resize", place); };
     }, [selected, !!message, polygon, opening]);
     if (!selected && !message) return null;
     const label = (key: string, fallback: string) => translate(`RoadGrass.MANUAL[${key}]`, fallback);
     const field = (index: number, name: string) => {
         const max = offsetLimit;
         const set = (value: number) => { if (Number.isFinite(value)) trigger(mod.id, "SetPolygonShape", index, Math.min(max, Math.max(0, Math.round(value * 10) / 10))); };
-        return <div className="median-controller-properties-field" role="group" aria-label={name}
-            onWheel={event => { event.preventDefault(); if (editable) set(values[index] + (event.deltaY < 0 ? .1 : -.1)); }}>
-            <div className="median-controller-properties-caption">
-                <span>{name}</span><span>{values[index].toFixed(1)} m</span>
+        return <InfoSection disableFocus>
+            <InfoRow disableFocus left={name} right={`${values[index].toFixed(1)} m`} />
+            <div style={{width: "86%", alignSelf: "center"}}>
+                <Slider key={`${selected}-${index}`} start={0} end={max} value={values[index]} gamepadStep={.1} disabled={!editable} onChange={value => editable && set(value)} />
             </div>
-            <Slider start={0} end={max} value={values[index]} disabled={!editable} theme={sliderTheme} onChange={value => editable && set(value)} />
-        </div>;
+        </InfoSection>;
     };
-    const action = (key: string, text: string, src: string, value: number) =>
-        <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={src}
-            aria-label={label(key, text)} tooltip={label(key, text)} selected={surface === value}
-            aria-disabled={!editable} style={{opacity: editable ? 1 : .5}}
-            onSelect={() => editable && trigger(mod.id, "SetManualMedianSurface", value)} />;
-    return <>
-        <style>{propertiesStyle}</style>
-        <aside ref={panel} className={polygon ? "median-controller-properties" : undefined} aria-label={polygon ? label("PolygonTitle", "Polygon Median") : label("Title", "Manual median")} style={{position: "fixed", left: position.left, bottom: position.bottom, zIndex: 10,
-            marginBottom: "12rem", width: "300rem", padding: "12rem", borderRadius: "6rem",
-            backgroundColor: polygon ? "#1c242b" : "rgba(28, 36, 43, 0.97)", boxShadow: "0 4rem 14rem rgba(0,0,0,0.4)"}}>
-            <div className={polygon ? "median-controller-properties-title" : undefined} style={polygon ? undefined : {fontSize: "16rem", marginBottom: "10rem"}}>{polygon ? label("PolygonTitle", "Polygon Median") : label("Title", "Manual median")}{selected ? ` #${selected}` : ""}</div>
-            {!!selected && <>
+    return <><span ref={anchor} style={{display: "none"}} /><Portal><Panel allowFocusExit
+        aria-label={polygon ? label("PolygonTitle", "Polygon Median") : label("Title", "Manual median")}
+        header={<PanelTitleBar>{polygon ? label("PolygonTitle", "Polygon Median") : label("Title", "Manual median")}{selected ? ` #${selected}` : ""}</PanelTitleBar>}
+        style={{position: "fixed", left: position.left, bottom: position.bottom, padding: 0, marginBottom: "12rem", width: position.width, visibility: position.width ? "visible" : "hidden"}}>
+            {!!selected && <InfoSection disableFocus><>
+
                 <Section title={label("Surface", "Surface")}>
-                    {action("Grass", "Grass", grass, 1)}
-                    {action("Plain", "Plain", plain, 2)}
-                    {action("ResetSurface", "Reset Surface", reset, 0)}
+                    <MedianSurfaceDropdown key={selected} focusKey={`median-controller-surface-${selected}`}
+                        value={texture} disabled={!editable} onChange={value => editable && trigger(mod.id, "SetMedianTexture", value)} />
                 </Section>
                 <Section title={label("Remove", "Remove")}>
                     <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src="coui://uil/Standard/XClose.svg"
                         aria-label={label("Remove", "Remove")} tooltip={label("RemoveHint", "Remove only this manual median")}
-                        aria-disabled={!editable} onSelect={() => editable && trigger(mod.id, "RemoveManualMedian")} />
+                        disabled={!editable} onSelect={() => editable && trigger(mod.id, "RemoveManualMedian")} />
                 </Section>
-            </>}
-            {!!message && <div role="status" style={{fontSize: "13rem", marginTop: "8rem", whiteSpace: "normal"}}>{message}</div>}
+            </></InfoSection>}
+            {!!message && <InfoSection disableFocus><div role="status">{message}</div></InfoSection>}
         {polygon && <>
+            <InfoSection disableFocus>
+                <InfoRow disableFocus left={label("TextureTiling", "Texture tiling")} right={`${textureTiling.toFixed(2)}x`} />
+                <div style={{width: "86%", alignSelf: "center"}}>
+                    <Slider key={`${selected}-tiling`} start={.25} end={4} value={textureTiling} disabled={!editable} gamepadStep={.05}
+                        onChange={value => editable && Number.isFinite(value) && trigger(mod.id, "SetPolygonTextureTiling", Math.round(value * 20) / 20)} />
+                </div>
+            </InfoSection>
+            <InfoSection disableFocus>
+            <Section title={label("EditPoints", "Edit")}>
+                <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={editPolygon} selected={pointEditing}
+                    aria-label={label("EditPoints", "Edit")}
+                    tooltip={label("EditPointsHint", "Drag points to reshape the median, click an edge to add a point, or use the secondary action on a point to remove it")}
+                    disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonPointEditing", !pointEditing)} />
+            </Section>
             <Section title={label("ExtendFromMedian", "Extend from median")}>
                 <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={connect} selected={polygonExtend}
                     aria-label={label("ExtendFromMedian", "Extend from median")}
                     tooltip={label("ExtendFromMedianHint", "Open the joining curb and remove the original median end cap where this polygon joins its two end corners")}
-                    aria-disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonExtendFromMedian", !polygonExtend)} />
+                    disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonExtendFromMedian", !polygonExtend)} />
             </Section>
-            <div className="median-controller-properties-fields">
-            {field(0, opening ? label("LineOffset", "Line offset") : label("Offset", "Offset"))}
-            {opening && field(1, label("MedianOffset", "Median offset"))}
-            {field(2, opening ? label("LineRadius", "Line corner radius") : label("Radius", "Corner radius"))}
-            {opening && field(3, label("MedianRadius", "Median corner radius"))}
-            <div className="median-controller-properties-field" role="group" aria-label={label("CurbWidth", "Curb width")}>
-                <div className="median-controller-properties-caption">
-                    <span>{label("CurbWidth", "Curb width")}</span><span>{curbWidth.toFixed(2)} m</span>
+            <Section title={label("CrosswalkGaps", "Crosswalk gaps")}>
+                <Tooltip tooltip={crosswalkGapsAvailable
+                    ? label("CrosswalkGapsHint", "Leave detected crosswalks at street level by cutting gaps through this median")
+                    : label("CrosswalkGapsLocked", "Temporarily disabled. Enable Crosswalk gaps in Developer settings.")}>
+                    <Checkbox debugName={label("CrosswalkGaps", "Crosswalk gaps")} checked={crosswalkGaps} disabled={!editable || !crosswalkGapsAvailable}
+                        onChange={value => editable && crosswalkGapsAvailable && trigger(mod.id, "SetCrosswalkGaps", value)} />
+                </Tooltip>
+            </Section>
+            </InfoSection>
+            <InfoSectionFoldout key={`more-settings-${selected}`} header={label("MoreSettings", "More Settings")} initialExpanded={false} disableFocus>
+                {field(0, opening ? label("LineOffset", "Line offset") : label("Offset", "Offset"))}
+                {opening && field(1, label("MedianOffset", "Median offset"))}
+                {field(2, opening ? label("LineRadius", "Line corner radius") : label("Radius", "Corner radius"))}
+                {opening && field(3, label("MedianRadius", "Median corner radius"))}
+            </InfoSectionFoldout>
+            <InfoSection disableFocus>
+                <InfoRow disableFocus left={label("CurbWidth", "Curb width")} right={`${curbWidth.toFixed(2)} m`} />
+                <div style={{width: "86%", alignSelf: "center"}}>
+                    <Slider key={`${selected}-curb`} start={.03} end={1} value={curbWidth} disabled={!editable} gamepadStep={.01}
+                        onChange={value => editable && Number.isFinite(value) && trigger(mod.id, "SetPolygonCurbWidth", Math.round(value * 100) / 100)} />
                 </div>
-                <Slider start={.03} end={1} value={curbWidth} disabled={!editable} theme={sliderTheme}
-                    onChange={value => editable && Number.isFinite(value) && trigger(mod.id, "SetPolygonCurbWidth", Math.round(value * 100) / 100)} />
-            </div>
-            </div>
-            <div className="median-controller-properties-footer">
+            </InfoSection>
+            <InfoSection disableFocus><Section title={label("ResetShape", "Reset Shape")}>
                 <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={resetCurb}
                     aria-label={label("ResetCurb", "Reset curb width")} tooltip={label("ResetCurbHint", "Restore the original median prefab's curb width")}
-                    aria-disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonCurbWidth", 0)} />
+                    disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonCurbWidth", 0)} />
             <ToolButton focusKey={FOCUS_DISABLED} className={toolButtonTheme.button} src={resetShape}
                 aria-label={label("ResetShape", "Reset Shape")} tooltip={label("ResetShapeHint", "Reset offsets, corner radii and curb width; keep the selected surface")}
-                aria-disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonShape", -1, 0)} />
-            </div>
+                disabled={!editable} onSelect={() => editable && trigger(mod.id, "SetPolygonShape", -1, 0)} />
+            </Section></InfoSection>
         </>}
-        </aside>
-    </>;
+    </Panel></Portal></>;
 };

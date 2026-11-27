@@ -30,19 +30,29 @@ namespace RoadGrass
         private ValueBinding<bool> m_SnappingBinding;
         private ValueBinding<bool> m_PlacingPolygonPointsBinding;
         private ValueBinding<bool> m_PolygonExtendBinding;
+        private ValueBinding<bool> m_CrosswalkGapsBinding;
+        private bool m_CrosswalkGaps;
+        internal bool CrosswalkGaps => RoadGrassSettings.CrosswalkGapsEnabled && m_CrosswalkGaps;
+        private ValueBinding<bool> m_CrosswalkGapsAvailableBinding;
         private ValueBinding<float> m_PolygonCurbWidthBinding;
+        private ValueBinding<float> m_PolygonTextureTilingBinding;
         internal bool PolygonSnapping { get; private set; } = true;
         internal bool PolygonExtendFromMedian { get; private set; } = true;
         private ValueBinding<int> m_SelectedManualBinding, m_ManualSurfaceBinding;
         private ValueBinding<bool> m_CanEditManualBinding;
         private ValueBinding<string> m_ManualMessageBinding;
         private ValueBinding<bool> m_PolygonSelectedBinding, m_PolygonOpeningBinding;
+        private ValueBinding<bool> m_PolygonPointEditingBinding;
+        private ValueBinding<int> m_MedianTextureBinding;
+        private RawValueBinding m_PolygonSurfaceOptionsBinding;
         private ValueBinding<float> m_LineOffsetBinding, m_MedianOffsetBinding, m_LineRadiusBinding, m_MedianRadiusBinding, m_OffsetLimitBinding;
 
         internal MedianControllerMode ActiveMode { get; private set; } = MedianControllerMode.Connect;
         internal MedianCapChoice EditCapChoice { get; private set; } = MedianCapChoice.Rounded;
         internal bool ExtendIntoIntersection { get; private set; }
         internal MedianSurfaceChoice EditSurfaceChoice { get; private set; } = MedianSurfaceChoice.Grass;
+        internal float EditTextureTiling { get; private set; } = 1;
+        private ValueBinding<float> m_EditTextureTilingBinding;
         internal MedianResetFilters ResetFilters { get; private set; } = MedianResetFilters.All;
         public override GameMode gameMode => GameMode.GameOrEditor;
 
@@ -66,6 +76,15 @@ namespace RoadGrass
             AddBinding(new TriggerBinding<bool>(ModId, "SetPolygonSnapping", value =>
             { PolygonSnapping = value; m_SnappingBinding.Update(value); }));
             AddBinding(m_PolygonExtendBinding = new ValueBinding<bool>(ModId, "PolygonExtendFromMedian", PolygonExtendFromMedian));
+            AddBinding(m_CrosswalkGapsBinding = new ValueBinding<bool>(ModId, "CrosswalkGaps", false));
+            AddBinding(m_CrosswalkGapsAvailableBinding = new ValueBinding<bool>(ModId, "CrosswalkGapsAvailable", RoadGrassSettings.CrosswalkGapsEnabled));
+            AddBinding(new TriggerBinding<bool>(ModId, "SetCrosswalkGaps", value =>
+            {
+                if (!RoadGrassSettings.CrosswalkGapsEnabled) return;
+                m_CrosswalkGaps = value;
+                RoadGrassJoinCompositionSystem.Instance?.SetPolygonCrosswalkGaps(value);
+                m_CrosswalkGapsBinding.Update(value);
+            }));
             AddBinding(new TriggerBinding<bool>(ModId, "SetPolygonExtendFromMedian", value =>
             {
                 PolygonExtendFromMedian = value;
@@ -74,9 +93,19 @@ namespace RoadGrass
             }));
             AddBinding(m_SelectedManualBinding = new ValueBinding<int>(ModId, "SelectedManualMedianId", 0));
             AddBinding(m_ManualSurfaceBinding = new ValueBinding<int>(ModId, "SelectedManualMedianSurface", 0));
+            AddBinding(m_MedianTextureBinding = new ValueBinding<int>(ModId, "SelectedMedianTexture", 0));
+            AddBinding(m_PolygonSurfaceOptionsBinding = new RawValueBinding(ModId, "PolygonSurfaceOptions", writer =>
+            {
+                var manager = RoadGrassJoinCompositionSystem.Instance;
+                if (manager != null) manager.WritePolygonSurfaceOptions(writer);
+                else { writer.ArrayBegin(0); writer.ArrayEnd(); }
+            }));
+            AddBinding(new TriggerBinding<int>(ModId, "SetMedianTexture", value => RoadGrassJoinCompositionSystem.Instance?.SetMedianTexture(value)));
             AddBinding(m_CanEditManualBinding = new ValueBinding<bool>(ModId, "CanEditSelectedManualMedian", false));
             AddBinding(m_ManualMessageBinding = new ValueBinding<string>(ModId, "ManualMedianMessage", ""));
             AddBinding(m_PolygonSelectedBinding = new ValueBinding<bool>(ModId, "SelectedIsPolygon", false));
+            AddBinding(m_PolygonPointEditingBinding = new ValueBinding<bool>(ModId, "PolygonPointEditing", false));
+            AddBinding(new TriggerBinding<bool>(ModId, "SetPolygonPointEditing", value => m_JoinToolSystem.SetPolygonPointEditing(value)));
             AddBinding(m_PolygonOpeningBinding = new ValueBinding<bool>(ModId, "PolygonHasOpening", false));
             AddBinding(m_LineOffsetBinding = new ValueBinding<float>(ModId, "PolygonLineOffset", 0));
             AddBinding(m_MedianOffsetBinding = new ValueBinding<float>(ModId, "PolygonMedianOffset", 0));
@@ -84,6 +113,8 @@ namespace RoadGrass
             AddBinding(m_MedianRadiusBinding = new ValueBinding<float>(ModId, "PolygonMedianRadius", 0));
             AddBinding(m_OffsetLimitBinding = new ValueBinding<float>(ModId, "PolygonOffsetLimit", 1));
             AddBinding(m_PolygonCurbWidthBinding = new ValueBinding<float>(ModId, "PolygonCurbWidth", .12f));
+            AddBinding(m_PolygonTextureTilingBinding = new ValueBinding<float>(ModId, "PolygonTextureTiling", 1));
+            AddBinding(new TriggerBinding<float>(ModId, "SetPolygonTextureTiling", value => RoadGrassJoinCompositionSystem.Instance?.SetPolygonTextureTiling(value)));
             AddBinding(new TriggerBinding<float>(ModId, "SetPolygonCurbWidth", value => RoadGrassJoinCompositionSystem.Instance?.SetPolygonCurbWidth(value)));
             AddBinding(new TriggerBinding<int, float>(ModId, "SetPolygonShape", (field, value) => RoadGrassJoinCompositionSystem.Instance?.SetPolygonShape(field, value)));
             AddBinding(new TriggerBinding<int>(ModId, "SetManualMedianSurface", value =>
@@ -100,6 +131,13 @@ namespace RoadGrass
             AddBinding(m_ModeBinding = new ValueBinding<int>(ModId, "ActiveMode", (int)ActiveMode));
             AddBinding(m_CapBinding = new ValueBinding<int>(ModId, "EditCapChoice", (int)EditCapChoice));
             AddBinding(m_SurfaceBinding = new ValueBinding<int>(ModId, "EditSurfaceChoice", (int)EditSurfaceChoice));
+            AddBinding(m_EditTextureTilingBinding = new ValueBinding<float>(ModId, "EditTextureTiling", EditTextureTiling));
+            AddBinding(new TriggerBinding<float>(ModId, "SetEditTextureTiling", value =>
+            {
+                if ((int)EditSurfaceChoice < 11 || float.IsNaN(value) || float.IsInfinity(value)) return;
+                EditTextureTiling = System.Math.Max(.25f, System.Math.Min(4, value));
+                m_EditTextureTilingBinding.Update(EditTextureTiling);
+            }));
             AddBinding(m_ResetBinding = new ValueBinding<int>(ModId, "ResetFilters", (int)ResetFilters));
             AddBinding(m_IsActiveBinding = new ValueBinding<bool>(ModId, "IsActive", false));
             AddBinding(m_ExtendBinding = new ValueBinding<bool>(ModId, "ExtendIntoIntersection", false));
@@ -118,7 +156,7 @@ namespace RoadGrass
             }));
             AddBinding(new TriggerBinding<int>(ModId, "SetEditSurfaceChoice", value =>
             {
-                if (value < 0 || value > (int)MedianSurfaceChoice.Plain) return;
+                if ((uint)value > 1 && !RoadGrassTerrainTextures.IsChoice(value)) return;
                 EditSurfaceChoice = (MedianSurfaceChoice)value;
                 m_SurfaceBinding.Update(value);
             }));
@@ -141,7 +179,8 @@ namespace RoadGrass
             bool active = m_ToolSystem.activeTool == m_JoinToolSystem &&
                 m_JoinToolSystem.GetPrefab()?.name == RoadGrassPrefabSystem.PrefabName;
             m_IsActiveBinding.Update(active);
-            if (!active) m_PlacingPolygonPointsBinding.Update(false);
+            if (!active)
+            { m_PlacingPolygonPointsBinding.Update(false); m_PolygonPointEditingBinding.Update(false); }
         }
 
         internal void SetActiveMode(int value)
@@ -163,21 +202,27 @@ namespace RoadGrass
             base.OnUpdate();
             SynchronizeTool();
             if (m_ToolSystem.activeTool != m_JoinToolSystem) return;
+            m_CrosswalkGapsAvailableBinding.Update(RoadGrassSettings.CrosswalkGapsEnabled);
             var manager = RoadGrassJoinCompositionSystem.Instance;
             m_PlacingPolygonPointsBinding.Update(m_ToolSystem.activeTool == m_JoinToolSystem &&
                 ActiveMode == MedianControllerMode.Polygon && m_JoinToolSystem.HasPendingSelection);
             m_SelectedManualBinding.Update(manager?.SelectedManualMedianId ?? 0);
             m_ManualSurfaceBinding.Update(manager?.SelectedManualMedianSurface ?? 0);
+            m_MedianTextureBinding.Update(manager?.SelectedMedianTexture ?? 0);
+            if (manager?.RefreshPolygonSurfaceOptions() == true) m_PolygonSurfaceOptionsBinding.Update();
             m_CanEditManualBinding.Update(manager?.CanEditSelectedManualMedian ?? false);
             m_ManualMessageBinding.Update(manager?.ManualMessage ?? "");
             m_PolygonSelectedBinding.Update(manager?.SelectedIsPolygon ?? false);
+            m_PolygonPointEditingBinding.Update(m_JoinToolSystem.PolygonPointEditing);
             m_PolygonExtendBinding.Update(manager?.SelectedIsPolygon == true ? manager.SelectedPolygonExtend : PolygonExtendFromMedian);
+            m_CrosswalkGapsBinding.Update(manager?.SelectedIsPolygon == true ? manager.SelectedPolygonCrosswalkGaps : CrosswalkGaps);
             m_PolygonOpeningBinding.Update(manager?.SelectedPolygonHasOpening ?? false);
             var shape = manager?.SelectedPolygonShape ?? default;
             m_LineOffsetBinding.Update(shape.x); m_MedianOffsetBinding.Update(shape.y);
             m_LineRadiusBinding.Update(shape.z); m_MedianRadiusBinding.Update(shape.w);
             m_OffsetLimitBinding.Update(manager?.SelectedPolygonOffsetLimit ?? 1);
             m_PolygonCurbWidthBinding.Update(manager?.SelectedPolygonCurbWidth ?? .12f);
+            m_PolygonTextureTilingBinding.Update(manager?.SelectedPolygonTextureTiling ?? 1);
         }
 
         [Preserve]

@@ -5,17 +5,18 @@ import { Children, cloneElement } from "react";
 import mod from "../../mod.json";
 import { VanillaComponentResolver } from "./VanillaComponentResolver";
 import { MedianManagementPanel } from "./MedianManagementPanel";
+import { MedianSurfaceDropdown } from "./MedianSurfaceDropdown";
 import connectIcon from "../icons/connect.svg";
 import roundedIcon from "../icons/rounded.svg";
 import straightIcon from "../icons/straight.svg";
 import polygonIcon from "../icons/polygon.svg";
 import grassIcon from "../icons/grass.svg";
-import plainIcon from "../icons/plain.svg";
 import allIcon from "../icons/all.svg";
 
 const mode$ = bindValue<number>(mod.id, "ActiveMode");
 const cap$ = bindValue<number>(mod.id, "EditCapChoice");
 const surface$ = bindValue<number>(mod.id, "EditSurfaceChoice");
+const textureTiling$ = bindValue<number>(mod.id, "EditTextureTiling");
 const filters$ = bindValue<number>(mod.id, "ResetFilters");
 const active$ = bindValue<boolean>(mod.id, "IsActive");
 const selectedManual$ = bindValue<number>(mod.id, "SelectedManualMedianId");
@@ -23,20 +24,11 @@ const selectedPolygon$ = bindValue<boolean>(mod.id, "SelectedIsPolygon");
 const snapping$ = bindValue<boolean>(mod.id, "PolygonSnapping");
 const placingPolygonPoints$ = bindValue<boolean>(mod.id, "PlacingPolygonPoints");
 const polygonExtend$ = bindValue<boolean>(mod.id, "PolygonExtendFromMedian");
+const crosswalkGaps$ = bindValue<boolean>(mod.id, "CrosswalkGaps");
+const crosswalkGapsAvailable$ = bindValue<boolean>(mod.id, "CrosswalkGapsAvailable");
 const tooltipStyle = getModule(
   "game-ui/common/tooltip/description-tooltip/description-tooltip.module.scss", "classes"
 );
-const sectionStyle = getModule(
-  "game-ui/game/components/tool-options/mouse-tool-options/mouse-tool-options.module.scss", "classes"
-);
-// Scope the Figma column layout to these reused vanilla sections. rem follows game UI scaling.
-const panelStyle = `
-.median-controller-options { position: relative; width: 380rem; padding: 6rem 0; }
-.median-controller-options .${sectionStyle.item} { min-height: 39rem; padding: 0 12rem; justify-content: flex-start; }
-.median-controller-options .${sectionStyle.label} { flex: 0 0 132rem; width: 132rem; margin-right: 18rem; }
-.median-controller-options .${sectionStyle.content} { justify-content: flex-start; margin-left: 0; }
-`;
-
 export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => () => {
   const active = useValue(active$);
   const mode = useValue(mode$);
@@ -45,17 +37,20 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
   const snapping = useValue(snapping$);
   const placingPolygonPoints = useValue(placingPolygonPoints$);
   const polygonExtend = useValue(polygonExtend$);
+  const crosswalkGaps = useValue(crosswalkGaps$);
+  const crosswalkGapsAvailable = useValue(crosswalkGapsAvailable$);
   const cap = useValue(cap$);
   const surface = useValue(surface$);
+  const textureTiling = useValue(textureTiling$);
   const filters = useValue(filters$);
   const { translate } = useLocalization();
   const result: JSX.Element = Component();
   if (!active) return result;
-  const { Section, ToolButton, toolButtonTheme, FOCUS_DISABLED } = VanillaComponentResolver.instance;
+  const { Section, ToolButton, toolButtonTheme, FOCUS_DISABLED, Checkbox, Tooltip, Slider, InfoRow } = VanillaComponentResolver.instance;
   const title = (key: string, fallback: string) => translate(`RoadGrass.SECTION_TITLE[${key}]`, fallback);
   const button = (key: string, label: string, description: string, src: string,
     selected: boolean, action: string, value: number | boolean, disabled = false) => (
-    <ToolButton key={key} src={src} selected={selected} aria-disabled={disabled} style={{opacity: disabled ? 0.5 : 1}} focusKey={FOCUS_DISABLED}
+    <ToolButton key={key} src={src} selected={selected} disabled={disabled} focusKey={FOCUS_DISABLED}
       className={toolButtonTheme.button} aria-label={label}
       onSelect={() => { if (!disabled) trigger(mod.id, action, value); }}
       tooltip={<div>
@@ -77,9 +72,18 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
       {button("Straight", "Straight", "Use the closed, flat median cap found beside a sidewalk crossing.", straightIcon, cap === 1, "SetEditCapChoice", 1)}
     </Section>,
     <Section key="surface" title={title("Surface", "Surface")}>
-      {button("Grass", "Grass", "Restore grass on the highlighted segment median.", grassIcon, surface === 0, "SetEditSurfaceChoice", 0)}
-      {button("Plain", "Plain", "Remove grass from the highlighted segment median.", plainIcon, surface === 1, "SetEditSurfaceChoice", 1)}
+      <MedianSurfaceDropdown focusKey="median-controller-edit-surface" value={surface < 2 ? surface + 1 : surface}
+        onChange={value => trigger(mod.id, "SetEditSurfaceChoice", value <= 2 ? value - 1 : value)} />
     </Section>
+  );
+  if (mode === 1 && !selectedManual && surface >= 11) rows.push(
+    <div key="textureTiling" style={{padding: "6rem 0"}}>
+      <InfoRow disableFocus left={translate("RoadGrass.MANUAL[TextureTiling]", "Texture tiling")} right={`${textureTiling.toFixed(2)}x`} />
+      <div style={{width: "86%", alignSelf: "center"}}>
+        <Slider start={.25} end={4} value={textureTiling} gamepadStep={.05}
+          onChange={value => Number.isFinite(value) && trigger(mod.id, "SetEditTextureTiling", Math.round(value * 20) / 20)} />
+      </div>
+    </div>
   );
     if (mode === 3 && !(selectedManual && selectedPolygon)) {
         rows.push(
@@ -88,10 +92,20 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
             </Section>
         );
     }
+    if ((mode === 0 || mode === 1 || mode === 3) && !(selectedManual && selectedPolygon)) {
+        rows.push(<Section key="crosswalkGaps" title={title("CrosswalkGaps", "Crosswalk gaps")}>
+            <Tooltip tooltip={crosswalkGapsAvailable
+                ? translate("RoadGrass.MANUAL[CrosswalkGapsHint]", "Leave detected crosswalks at street level by cutting gaps through this median")
+                : translate("RoadGrass.MANUAL[CrosswalkGapsLocked]", "Temporarily disabled. Enable Crosswalk gaps in Developer settings.")}>
+                <Checkbox debugName={title("CrosswalkGaps", "Crosswalk gaps")} checked={crosswalkGaps} disabled={!crosswalkGapsAvailable}
+                    onChange={value => crosswalkGapsAvailable && trigger(mod.id, "SetCrosswalkGaps", value)} />
+            </Tooltip>
+        </Section>);
+    }
     if (mode === 3 && placingPolygonPoints) {
         rows.push(
             <Section key="polygonSnapping" title={title("Snapping", "Snapping")}>
-                {button("PolygonSnapping", "Snapping", "Toggle lane, marking and median-corner snapping. Closing the polygon stays available when snapping is off.", polygonIcon, snapping, "SetPolygonSnapping", !snapping)}
+                {button("PolygonSnapping", "Contour snapping", "Follow connected lane and median edges with red points. Grey points connect straight. Disable for free placement.", polygonIcon, snapping, "SetPolygonSnapping", !snapping)}
             </Section>
         );
     }
@@ -104,6 +118,5 @@ export const RoadGrassToolOptions: ModuleRegistryExtend = (Component: any) => ()
     </Section>
   );
   return cloneElement(result, {}, ...Children.toArray(result.props.children),
-    <style key="median-controller-style">{panelStyle}</style>,
     <div key="median-controller-options" className="median-controller-options">{rows}{(mode === 3 || (mode === 1 && !!selectedManual)) && <MedianManagementPanel />}</div>);
 };

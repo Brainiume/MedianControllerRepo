@@ -5,6 +5,14 @@ using Unity.Mathematics;
 
 namespace RoadGrass
 {
+    internal enum PolygonTerrainLayer { None, Grass, Dirt, Rock, Extra1, Extra2, Extra3, Extra4 }
+
+    internal static class MedianTextureIdentity
+    {
+        // Reserved library identities share the existing durable surface channel, never catalog positions.
+        internal static bool IsCustom(int id) => id >= 1000 && id <= 1000000000;
+        internal static bool IsValid(int id) => (uint)id <= 7 || IsCustom(id);
+    }
     [InternalBufferCapacity(0)]
     public struct RoadGrassSavedManualMedian : IBufferElementData, ISerializable
     {
@@ -15,19 +23,27 @@ namespace RoadGrass
         internal float4 Shape; // line/median offset, line/median radius
         internal bool ExtendFromMedian;
         internal float CurbWidth; // Zero inherits the source prefab width.
+        internal PolygonTerrainLayer TerrainLayer;
+        internal bool CrosswalkGaps;
+        internal float TextureTiling; // Zero inherits the original 1x density.
+        internal float EffectiveTextureTiling => TextureTiling > 0 ? TextureTiling : 1;
         internal RoadGrassMedianAnchorKey Key => new RoadGrassMedianAnchorKey(Edge, Anchor.End, Anchor.Ordinal);
         public void Serialize<T>(T writer) where T : IWriter
         {
-            writer.Write(4); writer.Write(Id); writer.Write(Node); writer.Write(Edge);
+            int version = CrosswalkGaps ? 7 : EffectiveTextureTiling != 1 ? 6 : TerrainLayer == PolygonTerrainLayer.None ? 4 : 5;
+            writer.Write(version); writer.Write(Id); writer.Write(Node); writer.Write(Edge);
             Anchor.Serialize(writer); writer.Write((int)Surface);
             writer.Write(Shape.x); writer.Write(Shape.y); writer.Write(Shape.z); writer.Write(Shape.w);
             writer.Write(ExtendFromMedian);
             writer.Write(CurbWidth);
+            if (version >= 5) writer.Write((int)TerrainLayer);
+            if (version >= 6) writer.Write(EffectiveTextureTiling);
+            if (version >= 7) writer.Write(CrosswalkGaps);
         }
         public void Deserialize<T>(T reader) where T : IReader
         {
             reader.Read(out int version);
-            if (version < 1 || version > 4) throw new InvalidOperationException("Unsupported manual median version");
+            if (version < 1 || version > 7) throw new InvalidOperationException("Unsupported manual median version");
             reader.Read(out Id); reader.Read(out Node); reader.Read(out Edge);
             Anchor.Deserialize(reader); reader.Read(out int surface);
             Surface = surface >= 0 && surface <= 2 ? (MedianSavedSurface)surface : MedianSavedSurface.None;
@@ -37,6 +53,17 @@ namespace RoadGrass
             if (version >= 3) reader.Read(out ExtendFromMedian);
             CurbWidth = 0;
             if (version >= 4) reader.Read(out CurbWidth);
+            TerrainLayer = PolygonTerrainLayer.None;
+            if (version >= 5)
+            {
+                reader.Read(out int layer);
+                if (MedianTextureIdentity.IsValid(layer)) TerrainLayer = (PolygonTerrainLayer)layer;
+            }
+            if (TerrainLayer != PolygonTerrainLayer.None) Surface = MedianSavedSurface.Grass;
+            TextureTiling = 0;
+            if (version >= 6) { reader.Read(out TextureTiling); TextureTiling = math.isfinite(TextureTiling) && TextureTiling > 0 ? math.clamp(TextureTiling, .25f, 4) : 0; }
+            CrosswalkGaps = false;
+            if (version >= 7) reader.Read(out CrosswalkGaps);
             CurbWidth = math.isfinite(CurbWidth) ? math.clamp(CurbWidth, 0, 1) : 0;
             if (!math.all(math.isfinite(Shape))) Shape = default;
             Shape = math.clamp(Shape, 0, new float4(100, 100, 10, 10));

@@ -6,16 +6,19 @@ namespace RoadGrass
     {
         internal static NetCompositionPiece GetCapPiece(NetCompositionPiece piece, MedianSavedCap cap)
         {
-            const NetPieceFlags crosswalkCap = NetPieceFlags.PreserveShape | NetPieceFlags.BlockTraffic |
-                NetPieceFlags.Surface | NetPieceFlags.DisableTiling | NetPieceFlags.AsymmetricMeshZ | NetPieceFlags.HasMesh;
+            // The section also contains the pavement fan shared by the junction.
+            // Clipping or fixing its shape tears the surrounding node geometry.
+            const NetPieceFlags capFlags = NetPieceFlags.PreserveShape |
+                NetPieceFlags.BlockTraffic | NetPieceFlags.BlockCrosswalk;
             if (cap == MedianSavedCap.Straight &&
-                (piece.m_PieceFlags & (crosswalkCap | NetPieceFlags.BlockCrosswalk | NetPieceFlags.SkipBottomHalf)) == crosswalkCap &&
-                (piece.m_SectionFlags & (NetSectionFlags.Median | NetSectionFlags.FlipMesh)) == NetSectionFlags.Median)
+                (piece.m_PieceFlags & NetPieceFlags.HasMesh) != 0 &&
+                (piece.m_PieceFlags & capFlags) != 0)
             {
-                // Native node meshing keeps raw Z >= -0.01: the road-side curb.
-                // PreserveShape keeps its placement/UVs; the detached far curb is clipped.
-                // HalfLength participates in native mesh identity, unlike SkipBottomHalf.
-                piece.m_SectionFlags |= NetSectionFlags.HalfLength;
+                // This is only called for the selected median's replacement pieces.
+                // Normalize the cap orientation so the retained positive-Z half is
+                // at the road boundary, including originally flipped cap templates.
+                piece.m_SectionFlags = (piece.m_SectionFlags & ~NetSectionFlags.FlipMesh) | NetSectionFlags.HalfLength;
+                piece.m_PieceFlags |= NetPieceFlags.PreserveShape;
             }
             return piece;
         }

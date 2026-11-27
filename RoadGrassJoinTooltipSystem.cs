@@ -41,7 +41,10 @@ namespace RoadGrass
         ClosePolygon,
         InvalidPolygon,
         RemovePolygon,
-        PolygonMaterialUnavailable
+        PolygonMaterialUnavailable,
+        EditPolygonPoints,
+        DragPolygonPoint,
+        InsertPolygonPoint
     }
 
     /// <summary>
@@ -86,12 +89,14 @@ namespace RoadGrass
                 color = color
             });
             AddInputHint(GetInputAction(state));
-            if (state == RoadGrassJoinTooltipState.SelectManualMedian)
+            if (state == RoadGrassJoinTooltipState.SelectManualMedian || state == RoadGrassJoinTooltipState.DragPolygonPoint)
             {
                 AddMouseTooltip(new StringTooltip
                 {
                     path = "RoadGrass.JoinMedian.RemoveManualMedian",
-                    value = LocalizedString.IdWithFallback("RoadGrass.MANUAL[RemoveHint]", "Remove only this manual median")
+                    value = state == RoadGrassJoinTooltipState.DragPolygonPoint
+                        ? LocalizedString.IdWithFallback("RoadGrass.MOUSE_TOOLTIP[RemovePolygonPoint]", "Remove point, or cancel the current drag")
+                        : LocalizedString.IdWithFallback("RoadGrass.MANUAL[RemoveHint]", "Remove only this manual median")
                 });
                 AddInputHint(m_JoinToolSystem.SecondaryApplyInput);
             }
@@ -134,6 +139,8 @@ namespace RoadGrass
                 case RoadGrassJoinTooltipState.RemovePolygon:
                     return m_JoinToolSystem.SecondaryApplyInput;
                 case RoadGrassJoinTooltipState.EditSegment:
+                case RoadGrassJoinTooltipState.DragPolygonPoint:
+                case RoadGrassJoinTooltipState.InsertPolygonPoint:
                 case RoadGrassJoinTooltipState.PickTaperStart:
                 case RoadGrassJoinTooltipState.SelectManualMedian:
                 case RoadGrassJoinTooltipState.ResetManualMedian:
@@ -162,6 +169,15 @@ namespace RoadGrass
             localeKey = $"RoadGrass.MOUSE_TOOLTIP[{state}]";
             switch (state)
             {
+                case RoadGrassJoinTooltipState.EditPolygonPoints:
+                    fallback = "Drag a point, or click an edge to add a point";
+                    break;
+                case RoadGrassJoinTooltipState.DragPolygonPoint:
+                    fallback = "Hold and drag point; release to apply";
+                    break;
+                case RoadGrassJoinTooltipState.InsertPolygonPoint:
+                    fallback = "Add point on this edge";
+                    break;
                 case RoadGrassJoinTooltipState.EditSegment:
                     fallback = "Apply surface";
                     break;

@@ -8,28 +8,28 @@
 	<!--Long description of the mod. Single line or multi line. Supports minimal markdown subset-->
 	<!--LongDescription Value="This is a long description" /-->
 	<LongDescription>
-		# Median Controller
-		---------------------
-		# !!Closed Beta Version!!
-		# !!Expect Bugs and possible crashes; report any on discord channel!!
+# Median Controller
+---------------------
+# !!Closed Beta Version!!
+# !!Expect Bugs and possible crashes; report any on discord channel!!
 
-		# Features
+# Features
 
-		- Connect median endpoints through intersections, including medians with different widths.
-		- Edit road medians with Rounded or Straight end caps.
-		- Modify center median to be Grass or Pavement regardless of transit stop precence.
-		- Draw custom polygon medians using an existing median's style, with lane, road-marking and median-corner snapping.
-		- Select and edit created polygon medians, including their surface, curb width, offsets and corner rounding.
-		- Keep median edits and custom polygons when saving and reloading your city.
+- Connect median endpoints through intersections, including medians with different widths.
+- Edit road medians with Rounded or Straight end caps.
+- Modify center median to be Grass or Pavement regardless of transit stop precence.
+- Draw custom polygon medians using an existing median's style, with lane, road-marking and median-corner snapping.
+- Select and edit created polygon medians, including their surface, curb width, offsets and corner rounding.
+- Keep median edits and custom polygons when saving and reloading your city.
 
-		# Compatiblity
-		Tested working with:
-		- Road Builder 
-		- Traffic 
+# Compatiblity
+Tested working with:
+- Road Builder 
+- Traffic 
 		
-		Currently no incompatible mods have been reported/found.
+Currently no incompatible mods have been reported/found.
 		
-		Paradox Forum and Source Code to be Linked upon public release. 
+Paradox Forum and Source Code to be Linked upon public release. 
 	</LongDescription>
 	<!--Thumbnail-->
 	<Thumbnail Value="Properties/Thumbnail.png" />
@@ -43,7 +43,7 @@
 	<!--Link to the forum post where the mod can be discussed-->
 	<ForumLink Value="" />
 	<!--Version of the mod-->
-	<ModVersion Value="0.1.2" />
+	<ModVersion Value="0.1.7" />
 	<!--Recommended version of the base game to use the mod-->
 	<GameVersion Value="1.6.*" />
 	<!--Dependency for the mod, can be set multiple times-->
@@ -52,8 +52,12 @@
 	<RequiredDLC Value="" />
 	<!--Change log for new version. Single line or multi line. Supports minimal markdown subset-->
 	<ChangeLog Value="
-			   - Further Tooltip fixes
-			   - Null reference exception in tool lifecycle fixed
+**Performance**
+- Reduced unnecessary refreshing during gameplay and traffic-light edits.
+- Improved complex polygon creation, point editing and selection performance.
+- Reduced repeated rebuilding while adjusting sliders; texture tiling updates without refreshing the median.
+- Reduced texture memory usage and added lightweight previews for imported materials.
+ 
 			   " />
 	
 	<!--<ChangeLog>

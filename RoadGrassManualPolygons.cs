@@ -13,6 +13,16 @@ namespace RoadGrass
     internal partial class RoadGrassJoinCompositionSystem
     {
         private readonly HashSet<RoadGrassMedianAnchorKey> m_PolygonRenderKeys = new();
+        private readonly Dictionary<(int, int), int> m_PolygonSectionOrdinals = new();
+        private RoadGrassMedianAnchorKey PolygonSectionKey(Entity edge, bool end, int id, int section)
+        {
+            if (!m_PolygonSectionOrdinals.TryGetValue((id, section), out int ordinal))
+            {
+                ordinal = int.MaxValue - m_PolygonSectionOrdinals.Count;
+                m_PolygonSectionOrdinals.Add((id, section), ordinal);
+            }
+            return new RoadGrassMedianAnchorKey(edge, end, ordinal);
+        }
         private List<float3> m_PolygonPreviewPoints;
         private RoadGrassMedianAnchorKey m_PolygonPreviewKey;
         private MedianSavedSurface m_PolygonPreviewSurface;
@@ -23,30 +33,52 @@ namespace RoadGrass
         private readonly Dictionary<Entity, List<RoadGrassTaperGeometry.Lane>> m_PolygonGuides = new();
         private readonly Dictionary<(Entity, float3, float3), List<float3>> m_PolygonGuideEdges = new();
 
-        internal List<float3> PolygonGuideEdge(Entity node, float3 start, float3 end)
+        internal List<RoadGrassTaperGeometry.Lane> PolygonContourGuides(Entity node)
+        {
+            if (m_PolygonGuides.TryGetValue(node, out var guides)) return guides;
+            guides = new List<RoadGrassTaperGeometry.Lane>(GetMarkingGuides(node));
+            var seen = new HashSet<Entity>();
+            Read(node);
+            if (EntityManager.HasBuffer<ConnectedEdge>(node))
+                foreach (var edge in EntityManager.GetBuffer<ConnectedEdge>(node, true)) Read(edge.m_Edge);
+            foreach (var anchor in GetNodeAnchors(node))
+                if (RoadGrassMedianGeometry.TryGetOrientedApproach(EntityManager, anchor, out var approach))
+                { Add(approach.m_Left, median: true); Add(approach.m_Right, median: true); }
+            m_PolygonGuides[node] = guides;
+            return guides;
+            void Add(Bezier4x3 curve, string family = null, bool median = false) => guides.Add(new RoadGrassTaperGeometry.Lane { Curve = curve, Family = family, Median = median });
+            void Read(Entity owner)
+            {
+                TrackTaperDependency(owner);
+                if (!EntityManager.HasBuffer<Game.Net.SubLane>(owner)) return;
+                foreach (var sub in EntityManager.GetBuffer<Game.Net.SubLane>(owner, true))
+                {
+                    Entity lane = sub.m_SubLane;
+                    if (!seen.Add(lane) || EntityManager.HasComponent<Game.Common.Deleted>(lane) || EntityManager.HasComponent<Game.Tools.Temp>(lane) ||
+                        EntityManager.HasComponent<Game.Net.SecondaryLane>(lane) || !EntityManager.HasComponent<Game.Net.CarLane>(lane) ||
+                        !EntityManager.TryGetComponent(lane, out Game.Net.Curve curve) || !EntityManager.TryGetComponent(lane, out PrefabRef prefab) ||
+                        !EntityManager.TryGetComponent(prefab.m_Prefab, out NetLaneData data)) continue;
+                    TrackTaperDependency(lane);
+                    float2 width = new float2(data.m_Width);
+                    if (EntityManager.TryGetComponent(lane, out NodeLane nodeLane)) width += nodeLane.m_WidthOffset;
+                    if (!math.all(math.isfinite(width)) || math.any(width <= 0)) continue;
+                    string family = null;
+                    if (EntityManager.TryGetComponent(lane, out Game.Net.Lane identity)) family = identity.m_StartNode.GetOwnerIndex()+":"+identity.m_StartNode.GetLaneIndex()+":"+identity.m_StartNode.IsSecondary();
+                    Add(NetUtils.OffsetCurveLeftSmooth(curve.m_Bezier, width * .5f), family);
+                    Add(NetUtils.OffsetCurveLeftSmooth(curve.m_Bezier, width * -.5f), family);
+                }
+            }
+        }
+        internal List<float3> PolygonContourEdge(Entity node, float3 start, float3 end)
         {
             var key = (node, start, end);
             if (m_PolygonGuideEdges.TryGetValue(key, out var path)) return path;
-            if (!m_PolygonGuides.TryGetValue(node, out var lanes))
-            {
-                lanes = new List<RoadGrassTaperGeometry.Lane>(GetMarkingGuides(node));
-                if (EntityManager.HasBuffer<Game.Net.SubLane>(node))
-                    foreach (var sub in EntityManager.GetBuffer<Game.Net.SubLane>(node, true))
-                    {
-                        Entity lane = sub.m_SubLane;
-                        if (!EntityManager.HasComponent<Game.Net.CarLane>(lane) ||
-                            !EntityManager.TryGetComponent(lane, out Game.Net.Curve curve) ||
-                            !EntityManager.TryGetComponent(lane, out PrefabRef prefab) ||
-                            !EntityManager.TryGetComponent(prefab.m_Prefab, out NetLaneData data)) continue;
-                        lanes.Add(new RoadGrassTaperGeometry.Lane { Curve = curve.m_Bezier, Width = data.m_Width });
-                    }
-                m_PolygonGuides[node] = lanes;
-            }
-            path = RoadGrassLaneGuideResolver.FollowEdge(start, end, lanes);
+            path = m_ContourGraphs.TryGetValue(node, out var graph) ? graph.Edge(start, end) : null;
             m_PolygonGuideEdges[key] = path;
             return path;
         }
-
+        internal List<float3> PolygonGuideEdge(Entity node, float3 start, float3 end) =>
+            PolygonContourEdge(node, start, end) ?? new List<float3> { start, end };
         internal bool CanDrawPolygon(RoadGrassResolvedMedianAnchor anchor) => anchor != null && m_GameReady &&
             !m_SuspendedForSave && !m_WaitingForLoadSettle && !m_CityQuery.IsEmptyIgnoreFilter;
 
@@ -143,11 +175,48 @@ namespace RoadGrass
                 CompositionPiecesEqual(cached.Source.Pieces, source.Pieces)) return cached.Profile;
             // Resolver objects change on tool/network refreshes. Cache by median
             // identity and physical profile, avoiding repeated native asset loads.
-            var profile = RoadGrassPolygonPrototypeMesh.ReadProfile(EntityManager,
-                World.GetExistingSystemManaged<PrefabSystem>(), source);
+            RoadGrassPolygonPrototypeMesh.Profile profile;
+            try
+            {
+                profile = RoadGrassPolygonPrototypeMesh.ReadProfile(EntityManager,
+                    World.GetExistingSystemManaged<PrefabSystem>(), source);
+            }
+            catch (System.Exception error)
+            {
+                // Cache failed asset reads too; geometry invalidation permits a fresh attempt.
+                m_PolygonProfiles[key] = (source, default);
+                Mod.TryWarn("Median geometry profile unavailable: " + error.Message);
+                return default;
+            }
             m_PolygonProfiles[key] = (source, profile);
             Mod.TryInfo($"[PolygonProfile] width={source.Width} inset={profile.Insets} curb={profile.CurbWidth} height={profile.Height} base={profile.BaseHeight} bevel={profile.TopInset} section={profile.Section?.Count ?? 0} uv={profile.CurbU}/{profile.TextureScale}");
             return profile;
+        }
+
+        private bool TryPolygonRenderProfile(RoadGrassResolvedMedianAnchor source, MedianSavedSurface surface,
+            out RoadGrassResolvedMedianAnchor fillSource, out RoadGrassResolvedMedianAnchor curbSource,
+            out RoadGrassPolygonPrototypeMesh.Profile profile, out bool grass)
+        {
+            profile = default; curbSource = null; grass = false;
+            if (!TryPolygonSurface(source, surface, out fillSource)) return false;
+            grass = surface == MedianSavedSurface.Grass || (surface == MedianSavedSurface.None &&
+                (fillSource.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
+            profile = PolygonProfile(fillSource);
+            if ((profile.CurbPiece == Entity.Null || (!grass && profile.PavementPiece == Entity.Null)) &&
+                TryVanillaPolygonSurface(source, grass ? MedianSavedSurface.Grass : MedianSavedSurface.Plain, out var vanilla))
+            { fillSource = vanilla; profile = PolygonProfile(vanilla); }
+            curbSource = fillSource;
+            // Plain crowns do not expose the grass/curb boundary. Use the matching grass curb for both styles.
+            if (!grass && TryPolygonSurface(source, MedianSavedSurface.Grass, out var grassSource))
+            {
+                var curbProfile = PolygonProfile(grassSource);
+                if (curbProfile.CurbPiece != Entity.Null)
+                {
+                    curbSource = grassSource;
+                    profile = RoadGrassPolygonPrototypeMesh.WithPavementFill(curbProfile, profile);
+                }
+            }
+            return profile.CurbPiece != Entity.Null && (grass || profile.PavementPiece != Entity.Null);
         }
 
         private List<RoadGrassPolygonShape.Loop> BuildPolygonLoops(RoadGrassResolvedMedianAnchor source,
@@ -205,6 +274,13 @@ namespace RoadGrass
             out RoadGrassResolvedMedianAnchor styled)
         {
             if (TryManualSurface(anchor, surface, out styled)) return true;
+            return TryVanillaPolygonSurface(anchor, surface, out styled);
+        }
+
+        private bool TryVanillaPolygonSurface(RoadGrassResolvedMedianAnchor anchor, MedianSavedSurface surface,
+            out RoadGrassResolvedMedianAnchor styled)
+        {
+            styled = null;
             bool grass = surface == MedianSavedSurface.Grass || (surface == MedianSavedSurface.None &&
                 (anchor.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
             var prefabs = World.GetExistingSystemManaged<PrefabSystem>();
@@ -236,7 +312,8 @@ namespace RoadGrass
                     Key = anchor.Key, Node = anchor.Node, Data = anchor.Data,
                     SourceComposition = anchor.SourceComposition, RoadComposition = anchor.RoadComposition,
                     StandaloneComposition = composition, Pieces = pieces, Center = anchor.Center,
-                    Width = composition.m_Width, Left = anchor.Left, Right = anchor.Right, Signature = anchor.Signature
+                    Width = composition.m_Width, Left = anchor.Left, Right = anchor.Right,
+                    Signature = unchecked(anchor.Signature * 397 ^ piece.GetHashCode())
                 };
                 return true;
             }
@@ -277,9 +354,9 @@ namespace RoadGrass
             if (RoadGrassPolygonPrototypeBatchSystem.Instance?.IsReady(median.Saved.Id) == true)
                 return TryPlanEndpoint(source, MedianSavedCap.None, out plan, true);
             bool any = false;
-            for (int i = 0; i < 256; i++)
+            for (int i = 0; i < median.RuntimeSections; i++)
             {
-                var key = new RoadGrassMedianAnchorKey(source.Key.Edge, source.Key.End, -(median.Saved.Id * 256 + i));
+                var key = PolygonSectionKey(source.Key.Edge, source.Key.End, median.Saved.Id, i);
                 if (!m_PolygonRenderKeys.Contains(key)) break;
                 if (!IsTaperMeshReady(key)) return false;
                 any = true;
@@ -287,13 +364,13 @@ namespace RoadGrass
             return any && TryPlanEndpoint(source, MedianSavedCap.None, out plan, true);
         }
 
-        internal bool PlacePolygon(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points, MedianSavedSurface surface, IReadOnlyList<bool> snapped = null, bool extendFromMedian = true)
+        internal bool PlacePolygon(RoadGrassResolvedMedianAnchor anchor, IReadOnlyList<float3> points, MedianSavedSurface surface, IReadOnlyList<bool> snapped = null, bool extendFromMedian = true, bool crosswalkGaps = false)
         {
             if (!TryPolygonPreview(anchor, points, surface, out _, extendFromMedian)) return false;
             int id = 1;
             foreach (int existing in m_ManualMedians.Keys) id = math.max(id, existing + 1);
             if (id >= int.MaxValue / 256) { ManualMessage = "Too many saved medians"; return false; }
-            var saved = new RoadGrassSavedManualMedian { Id = id, Node = anchor.Node, Edge = anchor.Key.Edge, Anchor = anchor.Data, Surface = surface, ExtendFromMedian = extendFromMedian };
+            var saved = new RoadGrassSavedManualMedian { Id = id, Node = anchor.Node, Edge = anchor.Key.Edge, Anchor = anchor.Data, Surface = surface, ExtendFromMedian = extendFromMedian, CrosswalkGaps = crosswalkGaps };
             var median = new ManualMedian { Saved = saved };
             float3 origin = EntityManager.GetComponentData<Node>(anchor.Node).m_Position;
             for (int i = 0; i < points.Count; i++)
@@ -310,17 +387,21 @@ namespace RoadGrass
             m_ManualMedians.Add(id, median);
             SelectedManualMedianId = id;
             ManualMessage = "";
-            ClearTaperPlans(false); m_Dirty = true;
+            m_PolygonPreviewPoints = null; m_ManualPreviewSet = false;
+            QueuePolygonEdit(id);
             return true;
         }
 
         private bool TryResolvePolygon(ManualMedian median, out RoadGrassResolvedMedianAnchor anchor, out List<float3> points)
         {
-            points = new List<float3>();
+            points = null;
             anchor = null;
-            if (median.Points.Count < 3 || median.Points.Count > 128 ||
+            if (median.Points.Count < 3 ||
                 !TryResolveSavedAnchor(median.Saved.Edge, median.Saved.Anchor, out anchor) || anchor.Node != median.Saved.Node ||
                 !EntityManager.TryGetComponent(anchor.Node, out Node node)) return false;
+            if (median.ResolvedPoints != null && median.PointsEpoch == m_PolygonGuideEpoch)
+            { points = median.ResolvedPoints; return true; }
+            points = new List<float3>(median.Points.Count);
             for (int i = 0; i < median.Points.Count; i++)
             {
                 var p = median.Points[i];
@@ -333,6 +414,8 @@ namespace RoadGrass
                 }
                 else points.Add(node.m_Position + p);
             }
+            median.ResolvedPoints = points;
+            median.PointsEpoch = m_PolygonGuideEpoch;
             return true;
         }
 
@@ -344,9 +427,9 @@ namespace RoadGrass
                 if (GetManualOutline(id, out var outline)) yield return outline;
                 yield break;
             }
-            for (int i = 0; i < 256; i++)
+            for (int i = 0; i < median.RuntimeSections; i++)
             {
-                var key = new RoadGrassMedianAnchorKey(median.Saved.Edge, median.Saved.Anchor.End, -(id * 256 + i));
+                var key = PolygonSectionKey(median.Saved.Edge, median.Saved.Anchor.End, id, i);
                 if (!m_TaperPlans.TryGetValue(key, out var plan) || plan.Half == null) yield break;
                 yield return BuildEdgeGeometry(plan.Half.Geometry.m_Left.m_Left, plan.Half.Geometry.m_Right.m_Right);
             }
@@ -355,28 +438,34 @@ namespace RoadGrass
         private void SynchronizePolygon(int id, ManualMedian median)
         {
             // Shape edits can reduce the section count to zero; old plans must not remain pickable.
-            for (int i = 0; i < 256; i++)
-                m_TaperPlans.Remove(new RoadGrassMedianAnchorKey(median.Saved.Edge, median.Saved.Anchor.End, -(id * 256 + i)));
+            for (int i = 0; i < median.RuntimeSections; i++)
+            {
+                var oldKey = PolygonSectionKey(median.Saved.Edge, median.Saved.Anchor.End, id, i);
+                m_TaperPlans.Remove(oldKey); m_PolygonRenderKeys.Remove(oldKey);
+                m_RenderPairs.Remove(oldKey); m_Resolved.Remove(oldKey); m_RenderStates.Remove(oldKey);
+            }
             if (!EnsurePolygonPlan(median, out var source))
             {
-                RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
+                // A changed/unresolved parent median is not deletion of its road.
+                // Keep the existing custom mesh and saved polygon instead of recreating it.
                 return;
             }
             if (median.Halves == null && !BindPolygonSurface(source, median.Sections, median.Saved.Surface, out median.Halves, out var error))
             {
                 if (id == SelectedManualMedianId) ManualMessage = error;
-                RoadGrassPolygonPrototypeBatchSystem.Instance?.Remove(id);
                 return;
             }
             var halves = median.Halves;
+            median.RuntimeSections = halves.Count;
             bool prototype = TryQueuePolygonPrototype(id, median, source, out var prototypeError);
+            if (prototype) m_ManualOutlineIds.Remove(id); else m_ManualOutlineIds.Add(id);
             if (id == SelectedManualMedianId && prototypeError != null) ManualMessage = prototypeError;
             for (int i = 0; i < halves.Count; i++)
             {
                 var half = halves[i];
                 var original = half.Source;
-                var key = new RoadGrassMedianAnchorKey(source.Key.Edge, source.Key.End, -(id * 256 + i));
-                half.Source = new RoadGrassResolvedMedianAnchor
+                var key = PolygonSectionKey(source.Key.Edge, source.Key.End, id, i);
+                if (!original.Key.Equals(key)) half.Source = new RoadGrassResolvedMedianAnchor
                 {
                     Key = key, Node = original.Node, Data = original.Data, SourceComposition = original.SourceComposition,
                     RoadComposition = original.RoadComposition, StandaloneComposition = original.StandaloneComposition,
@@ -402,19 +491,29 @@ namespace RoadGrass
             var renderer = RoadGrassPolygonPrototypeBatchSystem.Instance;
             if (renderer == null) return false;
             if (median.Sections.Count == 0)
-            { renderer.Remove(id); reason = "Polygon has no drawable area"; return false; }
+            { reason = "Polygon has no drawable area"; return false; }
             if (!renderer.TryInitialize(out var error)) { reason = "Polygon mesh prototype unavailable: " + error; return false; }
-            if (renderer.Matches(id, median.Sections, median.Saved.Surface, out bool accepted, out reason)) return accepted;
-            if (!TryResolvePolygon(median, out source, out var points)) { renderer.Remove(id); return false; }
+            var crosswalks = median.Saved.CrosswalkGaps ? GetConnectionCrosswalks(source.Node) : null;
+            if (renderer.Matches(id, median.Sections, median.Saved.Surface, out bool accepted, out reason, median.Saved.TerrainLayer, median.Saved.EffectiveTextureTiling, crosswalks)) return accepted;
+            if (!TryResolvePolygon(median, out source, out var points)) return false;
             UnityEngine.Mesh mesh = null;
+            UnityEngine.Material pavementMaterial = null, grassMaterial = null;
+            List<UnityEngine.RenderTexture> fillTextures = null;
+            List<Colossal.IO.AssetDatabase.TextureAsset> materialTextures = null;
             try
             {
                 var loops = BuildPolygonLoops(source, points,
                     median.Saved.ExtendFromMedian ? PolygonOpeningEdges(source, points) : new bool[points.Count],
                     median.Saved.Shape, median.Saved.ExtendFromMedian);
                 var origin = EntityManager.GetComponentData<Node>(source.Node).m_Position;
-                var styled = median.Halves[0].Source;
-                var profile = PolygonProfile(styled);
+                if (!TryPolygonRenderProfile(source, median.Saved.Surface, out var styled, out var curbSource,
+                    out var profile, out bool grass))
+                { reason = "Native median curb/fill profile unavailable"; return false; }
+                median.NativeCurbWidth = profile.CurbWidth;
+                profile.InteriorTiling = median.Saved.EffectiveTextureTiling;
+                if (median.Saved.TerrainLayer != PolygonTerrainLayer.None &&
+                    RoadGrassTerrainTextures.TryGet(median.Saved.TerrainLayer, out _, out _))
+                    profile.TerrainScale = RoadGrassTerrainTextures.Scale(median.Saved.TerrainLayer);
                 if (median.Saved.ExtendFromMedian)
                     profile.AttachmentWidth = math.max(.001f, source.Width - math.csum(PolygonProfile(source).Insets));
                 if (median.Saved.CurbWidth > 0)
@@ -431,14 +530,26 @@ namespace RoadGrass
                         }
                     }
                 }
-                bool grass = median.Saved.Surface == MedianSavedSurface.Grass ||
-                    (median.Saved.Surface == MedianSavedSurface.None &&
-                    (styled.StandaloneComposition.m_Flags.m_General & CompositionFlags.General.PrimaryMiddleBeautification) != 0);
+                renderer.CopyMedianMaterials(EntityManager, World.GetExistingSystemManaged<PrefabSystem>(),
+                    styled, curbSource, profile, grass, out pavementMaterial, out grassMaterial, out materialTextures, out fillTextures);
+                if (median.Saved.TerrainLayer != PolygonTerrainLayer.None)
+                {
+                    if (renderer.TryTerrainMaterial(pavementMaterial, median.Saved.TerrainLayer, TerrainUsesLegacyNormals(median.Saved.TerrainLayer), out var terrainMaterial))
+                    {
+                        grassMaterial = terrainMaterial;
+                        if (median.Saved.Id == SelectedManualMedianId) ManualMessage = median.ShapeMessage;
+                    }
+                    else
+                    {
+                        profile.TerrainScale = 0;
+                        if (median.Saved.Id == SelectedManualMedianId) ManualMessage = "Surface texture is preparing or unavailable; native grass is shown.";
+                    }
+                }
                 var projection = GetPolygonHeightProjection(source);
                 float3 ProjectFoot(float3 p) => (projection == null ? p : projection(p)) + new float3(0, profile.BaseHeight, 0);
                 mesh = RoadGrassPolygonPrototypeMesh.Build(loops, origin, profile, ProjectFoot, grass);
                 if (mesh == null)
-                { renderer.Remove(id); reason = "Polygon mesh contains no drawable geometry"; return false; }
+                { reason = "Polygon mesh contains no drawable geometry"; return false; }
                 var outline = new List<Line3.Segment>();
                 foreach (var loop in loops)
                 for (int i = 0; i < loop.Points.Count; i++)
@@ -452,17 +563,29 @@ namespace RoadGrass
                     }
                     for (int sample = 0; sample < samples; sample++) outline.Add(new Line3.Segment(At(sample), At(sample + 1)));
                 }
-                RoadGrassPolygonPrototypeResources.CopyMedianMaterials(EntityManager,
-                    World.GetExistingSystemManaged<PrefabSystem>(), styled, grass, out var pavementMaterial, out var grassMaterial, out var materialTextures);
+                (UnityEngine.Vector3[] Vertices, int[] Triangles, UnityEngine.Bounds Bounds)? selection = null;
+                if (crosswalks != null && crosswalks.Count > 0)
+                {
+                    selection = (mesh.vertices, mesh.triangles, mesh.bounds);
+                    var capped = RoadGrassPolygonPrototypeMesh.Build(
+                        RoadGrassCrosswalkGeometry.CutLoops(loops, crosswalks), origin, profile, ProjectFoot, grass);
+                    // An entirely cut shape still keeps its original selection geometry.
+                    if (capped == null) capped = new UnityEngine.Mesh { subMeshCount = 2 };
+                    UnityEngine.Object.Destroy(mesh);
+                    mesh = capped;
+                }
                 renderer.Submit(id, median.Sections, median.Saved.Surface, mesh, origin, grass, outline,
-                    pavementMaterial, grassMaterial, materialTextures);
+                    pavementMaterial, grassMaterial, materialTextures, fillTextures, median.Saved.TerrainLayer, median.Saved.EffectiveTextureTiling, crosswalks, selection);
                 mesh = null; // Ownership transferred to the renderer.
                 return true;
             }
             catch (System.Exception exception)
             {
                 if (mesh != null) UnityEngine.Object.Destroy(mesh);
-                renderer.Remove(id);
+                RoadGrassPolygonPrototypeResources.ReleaseMaterial(pavementMaterial);
+                RoadGrassPolygonPrototypeResources.ReleaseMaterial(grassMaterial);
+                if (fillTextures != null) foreach (var tile in fillTextures) UnityEngine.Object.Destroy(tile);
+                if (materialTextures != null) foreach (var texture in materialTextures) texture.Unload();
                 reason = "Polygon mesh prototype: " + exception.Message;
                 return false;
             }
@@ -470,7 +593,8 @@ namespace RoadGrass
 
         internal void PolygonPrototypeChanged(int id, string error)
         {
-            m_Dirty = true;
+            if (!m_ManualMedians.ContainsKey(id)) return;
+            QueuePolygonEdit(id);
             if (id == SelectedManualMedianId && error != null) ManualMessage = error;
         }
     }
@@ -478,6 +602,33 @@ namespace RoadGrass
     internal static class RoadGrassPolygonSections
     {
         internal struct Section { internal Bezier4x3 Left, Right; }
+        internal static int2 PickEditHandles(IReadOnlyList<float3> points, Line3.Segment ray, float fovTan, out float3 insertion)
+        {
+            int2 handles = new int2(-1);
+            float bestVertex = float.MaxValue, bestEdge = float.MaxValue;
+            insertion = default;
+            float3 delta = ray.b - ray.a;
+            for (int i = 0; i < points.Count; i++)
+            {
+                float3 p = points[i] + new float3(0, .25f, 0);
+                float t = math.dot(p - ray.a, delta) / math.max(.0001f, math.lengthsq(delta));
+                float tolerance = math.clamp(math.distance(ray.a, p) * fovTan * .004f, .18f, .6f);
+                float distance = math.distance(p, ray.a + delta * t);
+                if (t >= 0 && t <= 1 && distance <= tolerance && distance < bestVertex)
+                { handles.x = i; bestVertex = distance; }
+                float3 end = points[(i + 1) % points.Count] + new float3(0, .25f, 0);
+                float plane = math.abs(delta.y) > .0001f ? ((p.y + end.y) * .5f - ray.a.y) / delta.y : -1;
+                if (plane < 0 || plane > 1) continue;
+                float3 cursor = ray.a + delta * plane;
+                float along = math.saturate(math.dot(cursor.xz - p.xz, end.xz - p.xz) /
+                    math.max(.0001f, math.lengthsq(end.xz - p.xz)));
+                float3 candidate = math.lerp(points[i], points[(i + 1) % points.Count], along);
+                distance = math.distance(cursor.xz, candidate.xz);
+                if (distance <= tolerance && distance < bestEdge)
+                { handles.y = i; bestEdge = distance; insertion = candidate; }
+            }
+            return handles;
+        }
 
         internal static bool RayHit(Segment strip, Line3.Segment ray, out float hit)
         {
@@ -527,9 +678,9 @@ namespace RoadGrass
         // Split at vertex heights: each native section has two straight polygon boundary
         // edges and open cross-sections. Concave polygons can have multiple spans per slice.
         internal static bool TryBuild(IReadOnlyList<float3> points, out List<Section> sections, out string reason, float2? attachmentForward = null,
-            int maxPoints = 128, int maxSections = 256)
+            int maxPoints = int.MaxValue, int maxSections = int.MaxValue)
         {
-            sections = new List<Section>(); reason = "Polygon needs at least three corners (128 outline samples maximum)";
+            sections = new List<Section>(); reason = "Polygon needs at least three corners";
             int count = points.Count;
             if (count < 3 || count > maxPoints) return false;
             reason = "Polygon contains a non-finite position";

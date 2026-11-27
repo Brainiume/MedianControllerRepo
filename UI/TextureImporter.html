@@ -1,0 +1,131 @@
+﻿<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Median Controller - Surface Importer</title>
+<style>
+:root{color-scheme:dark;--page:#11161b;--surface:#1b232a;--line:#34424d;--text:#eef4f7;--muted:#a8b6c0;--cyan:#37b9e9}*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--text);font:15px/1.5 "Segoe UI",Arial,sans-serif}.topbar{border-bottom:1px solid var(--line);background:#182027;padding:22px max(24px,calc((100% - 1120px)/2))}h1{margin:0;font-size:27px;font-weight:650}h2{margin:0 0 12px;font-size:18px}.subtitle,p,.hint{color:var(--muted)}.hint{font-size:13px}.subtitle{margin-top:4px}main{max-width:1168px;margin:auto;padding:22px 24px 48px}.page-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(260px,1fr);gap:20px;align-items:start}.panel{padding:22px;background:var(--surface);border:1px solid var(--line);border-radius:7px}label{display:block;font-weight:600;margin:15px 0 5px}input,select,button{font:inherit;border:1px solid #43535f;border-radius:4px;color:var(--text);background:#12191e;padding:8px}input[type=text],input[type=file],select{width:100%}input:focus,select:focus{outline:1px solid var(--cyan)}button{cursor:pointer;background:#26333c;margin:12px 8px 0 0;min-height:38px}button:hover{border-color:var(--cyan)}button:disabled{cursor:default;opacity:.5}#apply{width:100%;min-height:54px;font-size:17px;font-weight:700;background:#7133a7;border-color:#6d2fb1}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}code{display:block;padding:10px;background:#12191e;font:13px Consolas,monospace;overflow-wrap:anywhere}.preview{min-height:180px;background:#12191e;border:1px solid var(--line);border-radius:5px;padding:16px;display:flex;align-items:center;justify-content:center}#preview{width:100%;max-width:320px}#status:empty{display:none}#status{white-space:pre-wrap;padding:12px;border-left:3px solid var(--cyan);background:#12191e}#detected{white-space:pre-wrap;font-size:13px;overflow-wrap:anywhere}details{border-top:1px solid var(--line);padding-top:14px;margin-top:18px}summary{cursor:pointer;font-weight:600}
+@media(max-width:760px){.page-grid,.row{grid-template-columns:1fr}.row{gap:0}main{padding:16px}.topbar{padding:20px}}
+</style></head><body>
+<header class="topbar"><h1>Median Controller - Surface Importer</h1><div class="subtitle">Prepare a custom surface from a ZIP, folder or texture files.</div></header>
+<main>
+<div class="page-grid"><section class="panel"><h2>Surface material</h2><form id="form">
+<label for="name">Surface material name</label><input id="name" required maxlength="80" placeholder="Herringbone concrete" autocomplete="off">
+<div class="row"><div><label for="files">ZIP or multiple files</label><input id="files" type="file" accept=".zip,.png" multiple></div><div><label for="folder">Or select a folder</label><input id="folder" type="file" webkitdirectory multiple></div></div>
+<p class="hint">One material per import. Common PBR names are detected automatically, including Poly Haven names such as _diff_1k, _nor_gl_1k and _arm_1k.</p>
+<pre id="detected">Choose files to detect their maps.</pre>
+<details><summary>Review or override individual maps</summary><p class="hint">Manual selections override detected maps. For duplicate candidates, choose the correct file here.</p>
+<label for="basecolor">Base colour (required)</label><input id="basecolor" type="file" accept=".png">
+<div class="row"><div><label for="normal">Normal</label><input id="normal" type="file" accept=".png"></div><div><label for="normal-format">Normal format</label><select id="normal-format"><option value="gl">OpenGL</option><option value="dx">DirectX</option></select></div></div>
+<div class="row"><div><label for="maskmap">HDRP mask (metal / AO / unused / smoothness)</label><input id="maskmap" type="file" accept=".png"></div><div><label for="arm">ARM / ORM (AO / roughness / metal)</label><input id="arm" type="file" accept=".png"></div></div>
+<div class="row"><div><label for="metallic">Metallic</label><input id="metallic" type="file" accept=".png"></div><div><label for="occlusion">Ambient occlusion</label><input id="occlusion" type="file" accept=".png"></div></div>
+<div class="row"><div><label for="roughness">Roughness</label><input id="roughness" type="file" accept=".png"></div><div><label for="smoothness">Smoothness</label><input id="smoothness" type="file" accept=".png"></div></div>
+</details>
+<p class="hint">PNG maps: up to 4096 x 4096 and 64 MiB each. ZIPs: up to 512 MiB, standard ZIP with stored/Deflate entries. Unsupported files (including displacement) are skipped. Base colour alone is valid.</p>
+<label>Custom surfaces folder</label><code id="destination">__SURFACE_FOLDER__</code>
+<button id="copy" type="button">Copy folder path</button><button id="download" type="button">Download material pack</button><button id="apply" type="submit">Import surface</button>
+<p class="hint">Confirm the custom surfaces Library folder in your browser?s permission dialog. Your browser remembers the location for next time. Then use Refresh custom surfaces in mod settings, or restart the game.</p>
+</form><p id="status" role="status" aria-live="polite"></p></section>
+<aside class="panel"><h2>Base-colour preview</h2><div class="preview"><img id="preview" hidden alt="Selected base colour"><span id="empty-preview">Choose a material set</span></div><h3>Manual Import</h3><p>Download material pack works without the mod. Extract the named folder into <strong>Materials/Library</strong>, then refresh custom surfaces in settings.</p></aside></div></main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id), roles=["basecolor","normal","maskmap","metallic","occlusion","roughness","smoothness","arm"];
+const aliases={basecolor:["basecolor","basecolour","base_color","base_colour","albedo","diffuse","diff","color","colour","col"],normalgl:["normalgl","normal_gl","nor_gl","normal_opengl"],normaldx:["normaldx","normal_dx","nor_dx","normal_directx"],normal:["normal","normalmap","normal_map","nor","nrm"],maskmap:["maskmap","mask_map","mask"],metallic:["metallic","metalness","metal","met"],occlusion:["occlusion","ambientocclusion","ambient_occlusion","ao"],roughness:["roughness","rough","rgh"],smoothness:["smoothness","glossiness","gloss"],arm:["arm","orm","occlusionroughnessmetallic","ao_roughness_metallic"]};
+let detected={}, issues={}, previewUrl, revision=0;
+function materialName(value){const name=value.trim();if(!name||name.length>80||/[<>:"/\\|?*\x00-\x1f]/.test(name)||/[. ]$/.test(name)||name==="."||name===".."||/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name))throw Error("Enter a surface name without reserved filename characters (maximum 80 characters).");return name;}
+function classify(path){if(!/\.png$/i.test(path))return null;const name=path.split(/[\\/]/).pop().slice(0,-4).toLowerCase().replace(/[ .-]/g,"_").replace(/_(?:\d+k|\d{3,5})$/i,"");for(const role of ["arm",...Object.keys(aliases).filter(r=>r!=="arm")])if(aliases[role].some(s=>name===s||name.endsWith("_"+s)))return role;return null;}
+const sourceFile=file=>({name:file.name,getFile:async()=>file});
+function chooseMaps(sources){const groups={};for(const source of sources){const role=classify(source.name);if(role)(groups[role]??=[]).push(source);}const maps={}, errors={};for(const role of roles){const key=role==="normal"?["normalgl","normal","normaldx"].find(k=>groups[k]?.length):role,list=groups[key]||[];if(list.length===1)maps[role]={...list[0],directX:key==="normaldx"};else if(list.length>1)errors[role]="Multiple "+role+" maps: "+list.map(s=>s.name).join(", ");}return {maps,errors};}
+const crcTable=Uint32Array.from({length:256},(_,v)=>{for(let i=0;i<8;i++)v=v&1?0xedb88320^(v>>>1):v>>>1;return v>>>0;});
+function crc32(bytes){let crc=0xffffffff;for(const b of bytes)crc=crcTable[(crc^b)&255]^(crc>>>8);return(crc^0xffffffff)>>>0;}
+async function zipSources(file){
+ if(file.size>512*1024*1024)throw Error("ZIP exceeds 512 MiB.");
+ const tail=new Uint8Array(await file.slice(Math.max(0,file.size-65557)).arrayBuffer()), view=new DataView(tail.buffer);let end=-1;
+ for(let p=tail.length-22;p>=0;p--)if(view.getUint32(p,true)===0x06054b50&&p+22+view.getUint16(p+20,true)===tail.length){end=p;break;}
+ if(end<0||view.getUint16(end+4,true)||view.getUint16(end+6,true))throw Error("Use a standard, single-disk ZIP.");
+ const count=view.getUint16(end+10,true), size=view.getUint32(end+12,true), offset=view.getUint32(end+16,true);
+ if(count>512||size>32*1024*1024||offset+size>file.size||count===65535)throw Error("ZIP is too complex or uses ZIP64.");
+ const central=new Uint8Array(await file.slice(offset,offset+size).arrayBuffer()), c=new DataView(central.buffer), sources=[];let p=0,total=0;
+ for(let i=0;i<count;i++){
+  if(p+46>central.length||c.getUint32(p,true)!==0x02014b50)throw Error("Invalid ZIP directory.");
+  const flags=c.getUint16(p+8,true), method=c.getUint16(p+10,true), crc=c.getUint32(p+16,true), compressed=c.getUint32(p+20,true), length=c.getUint32(p+24,true), n=c.getUint16(p+28,true), extra=c.getUint16(p+30,true), comment=c.getUint16(p+32,true), local=c.getUint32(p+42,true);
+  if(p+46+n+extra+comment>central.length)throw Error("Truncated ZIP directory.");
+  const name=new TextDecoder().decode(central.slice(p+46,p+46+n));p+=46+n+extra+comment;
+  if(!classify(name))continue;
+  if(flags&1||![0,8].includes(method)||length>64*1024*1024||compressed>64*1024*1024||(total+=length)>512*1024*1024)throw Error("ZIP contains unsupported, encrypted or oversized texture maps.");
+  sources.push({name,getFile:async()=>{
+   const header=new DataView(await file.slice(local,local+30).arrayBuffer());if(header.byteLength!==30||header.getUint32(0,true)!==0x04034b50)throw Error("Invalid ZIP entry.");
+   const start=local+30+header.getUint16(26,true)+header.getUint16(28,true);if(start+compressed>offset)throw Error("Invalid ZIP entry bounds.");
+   let blob=file.slice(start,start+compressed);
+   if(method===8){let inflater;try{inflater=new DecompressionStream("deflate-raw");}catch{throw Error("This browser cannot extract Deflate ZIPs. Use a current Chrome/Edge version or select the extracted folder.");}
+    const reader=blob.stream().pipeThrough(inflater).getReader(),chunks=[];let read=0;try{while(true){const item=await reader.read();if(item.done)break;read+=item.value.length;if(read>length)throw Error("ZIP entry exceeds its declared size.");chunks.push(item.value);}}finally{await reader.cancel().catch(()=>{});}blob=new Blob(chunks);}
+   const bytes=new Uint8Array(await blob.arrayBuffer());if(bytes.length!==length||crc32(bytes)!==crc)throw Error("ZIP texture is corrupt: "+name);
+   return new File([bytes],name.split(/[\\/]/).pop(),{type:"image/png"});
+  }});
+ }
+ return sources;
+}
+async function scan(files){const generation=++revision;$("status").textContent="Detecting compatible maps...";try{const sources=[];for(const file of files){if(/\.zip$/i.test(file.name))sources.push(...await zipSources(file));else if(/\.png$/i.test(file.name))sources.push(sourceFile(file));}if(generation!==revision)return;({maps:detected,errors:issues}=chooseMaps(sources));$("normal-format").value=detected.normal?.directX?"dx":"gl";$("detected").textContent=roles.map(role=>issues[role]||(detected[role]?role+" <- "+detected[role].name:null)).filter(Boolean).join("\n")||"No compatible maps found. Use individual map overrides below.";$("status").textContent="Detected maps. Review the list, then import or download your material.";await updatePreview();}catch(error){if(generation===revision){detected={};issues={};$("detected").textContent="Choose another material set or use overrides.";$("status").textContent=error.message;}}}
+function selections(){const result={};for(const role of roles){const manual=$(role).files[0];if(manual)result[role]=sourceFile(manual);else if(issues[role])throw Error(issues[role]+". Choose an override.");else if(detected[role])result[role]=detected[role];}if(!result.basecolor)throw Error("A base-colour PNG is required. Assign one in the overrides if its name is unrecognised.");return result;}
+async function updatePreview(){if(previewUrl)URL.revokeObjectURL(previewUrl);const source=$("basecolor").files[0]?sourceFile($("basecolor").files[0]):detected.basecolor;$("preview").hidden=!source;$("empty-preview").hidden=!!source;if(source){previewUrl=URL.createObjectURL(await source.getFile());$("preview").src=previewUrl;}}
+async function validatePng(file){if(!/\.png$/i.test(file.name)||file.size>64*1024*1024)throw Error(file.name+": use a PNG up to 64 MiB.");const bytes=new Uint8Array(await file.slice(0,24).arrayBuffer()),sig=[137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82];if(bytes.length<24||sig.some((v,i)=>v!==bytes[i]))throw Error(file.name+": invalid PNG.");const view=new DataView(bytes.buffer),w=view.getUint32(16),h=view.getUint32(20);if(!w||!h||w>4096||h>4096)throw Error(file.name+": dimensions must be 1-4096 pixels.");return {width:w,height:h};}
+function canvas(width,height){const element=document.createElement("canvas");element.width=width;element.height=height;const context=element.getContext("2d",{willReadFrequently:true});if(!context)throw Error("Canvas image processing unavailable.");return {element,context};}
+async function imagePixels(file,width,height){const image=await createImageBitmap(file,{colorSpaceConversion:"none",premultiplyAlpha:"none"});try{const {context}=canvas(width||image.width,height||image.height);context.drawImage(image,0,0,context.canvas.width,context.canvas.height);return context.getImageData(0,0,context.canvas.width,context.canvas.height).data;}finally{image.close();}}
+async function pngBytes(width,height,pixels){const {element,context}=canvas(width,height);context.putImageData(new ImageData(pixels,width,height),0,0);const blob=await new Promise(resolve=>element.toBlob(resolve,"image/png"));if(!blob)throw Error("PNG encoding failed.");return new Uint8Array(await blob.arrayBuffer());}
+async function prepareMaterial(){
+ const name=materialName($("name").value), selected=selections(), files={}, dimensions={};$("status").textContent="Validating and preparing maps in your browser...";
+ for(const [role,source]of Object.entries(selected)){files[role]=await source.getFile();dimensions[role]=await validatePng(files[role]);}
+ const entries=[{name:"basecolor.png",bytes:new Uint8Array(await files.basecolor.arrayBuffer())}];
+ const preview=await imagePixels(files.basecolor,128,128);for(let i=3;i<preview.length;i+=4)preview[i]=255;
+ entries.push({name:"preview.png",bytes:await pngBytes(128,128,preview)});
+ if(files.normal){const d=dimensions.normal,pixels=await imagePixels(files.normal),invert=$("normal-format").value==="dx";for(let i=0;i<pixels.length;i+=4){if(invert)pixels[i+1]=255-pixels[i+1];pixels[i+2]=pixels[i+3]=255;}entries.push({name:"normal.png",bytes:await pngBytes(d.width,d.height,pixels)});}
+ const pbr=["maskmap","arm","metallic","occlusion","roughness","smoothness"],width=Math.max(1,...pbr.map(r=>dimensions[r]?.width||1)),height=Math.max(1,...pbr.map(r=>dimensions[r]?.height||1));
+ const packed=new Uint8ClampedArray(width*height*4);for(let i=0;i<packed.length;i+=4){packed[i+1]=255;packed[i+3]=64;}
+ for(const role of ["arm","maskmap","metallic","occlusion","roughness","smoothness"]){if(!files[role])continue;const source=await imagePixels(files[role],width,height);for(let i=0;i<packed.length;i+=4){if(role==="arm"){packed[i]=source[i+2];packed[i+1]=source[i];packed[i+3]=255-source[i+1];}else if(role==="maskmap"){packed[i]=source[i];packed[i+1]=source[i+1];packed[i+3]=source[i+3];}else if(role==="metallic")packed[i]=source[i];else if(role==="occlusion")packed[i+1]=source[i];else if(role==="roughness")packed[i+3]=255-source[i];else packed[i+3]=source[i];}}
+ entries.push({name:"maskmap.png",bytes:await pngBytes(width,height,packed)});
+ const hash=async bytes=>new Uint8Array(await crypto.subtle.digest("SHA-256",bytes)),signature=[];
+ for(const [i,filename]of ["basecolor.png","normal.png","maskmap.png","metallic.png","occlusion.png","roughness.png","smoothness.png"].entries()){signature.push(i);const entry=entries.find(e=>e.name===filename);if(entry)signature.push(...await hash(entry.bytes));}signature.push(0);
+ const identity=await hash(new Uint8Array(signature)),id=1000+new DataView(identity.buffer).getUint32(0,true)%999999001;
+ const manifest={schemaVersion:1,id,displayName:name,fingerprint:Array.from(identity,b=>b.toString(16).padStart(2,"0")).join("").toUpperCase(),baseColor:"basecolor.png",normal:files.normal?"normal.png":null,maskMap:"maskmap.png",metallic:null,occlusion:null,roughness:null,smoothness:null,normalDirectX:false,tileSizeMeters:1};
+ entries.push({name:"material.json",bytes:new TextEncoder().encode(JSON.stringify(manifest,null,2))});return {name,manifest,entries};
+}
+function makeZip(entries){const parts=[],central=[];let offset=0,centralSize=0;for(const entry of entries){const name=new TextEncoder().encode(entry.name),bytes=entry.bytes,crc=crc32(bytes),local=new Uint8Array(30),l=new DataView(local.buffer),header=new Uint8Array(46),c=new DataView(header.buffer);l.setUint32(0,0x04034b50,true);l.setUint16(4,20,true);l.setUint16(6,0x800,true);l.setUint16(12,33,true);l.setUint32(14,crc,true);l.setUint32(18,bytes.length,true);l.setUint32(22,bytes.length,true);l.setUint16(26,name.length,true);c.setUint32(0,0x02014b50,true);c.setUint16(4,20,true);c.setUint16(6,20,true);c.setUint16(8,0x800,true);c.setUint16(14,33,true);c.setUint32(16,crc,true);c.setUint32(20,bytes.length,true);c.setUint32(24,bytes.length,true);c.setUint16(28,name.length,true);c.setUint32(42,offset,true);parts.push(local,name,bytes);central.push(header,name);offset+=30+name.length+bytes.length;centralSize+=46+name.length;}const end=new Uint8Array(22),e=new DataView(end.buffer);e.setUint32(0,0x06054b50,true);e.setUint16(8,entries.length,true);e.setUint16(10,entries.length,true);e.setUint32(12,centralSize,true);e.setUint32(16,offset,true);return new Blob([...parts,...central,end],{type:"application/zip"});}
+function busy(value){$("apply").disabled=$("download").disabled=value;}
+$("files").addEventListener("change",event=>scan(Array.from(event.target.files)));$("folder").addEventListener("change",event=>scan(Array.from(event.target.files)));
+$("basecolor").addEventListener("change",()=>updatePreview().catch(error=>{$("status").textContent=error.message;}));
+$("copy").addEventListener("click",async()=>{try{await navigator.clipboard.writeText($("destination").textContent);$("status").textContent="Custom surfaces folder path copied.";}catch{$("status").textContent="The custom surfaces folder path is shown above.";}});
+async function writeFile(folder,name,data){
+ const handle=await folder.getFileHandle(name,{create:true}),stream=await handle.createWritable();
+ try{await stream.write(data);await stream.close();}catch(error){await stream.abort().catch(()=>{});throw error;}
+}
+$("form").addEventListener("submit",async event=>{
+ event.preventDefault();
+ try{
+  materialName($("name").value);selections();
+  if(typeof showDirectoryPicker!=="function")throw Error("Use Chrome/Edge for browser-authorized import, or Download material pack for Manual Import.");
+  // Always ask through the browser; its picker remembers the previously selected Library location.
+  const directory=await showDirectoryPicker({id:"median-controller-surfaces",mode:"readwrite"});
+  let marker;
+  try{marker=await directory.getFileHandle(".median-controller-materials");}catch{throw Error("Choose the custom surfaces Library folder shown above. Use Copy folder path to paste its location into the dialog.");}
+  if(await(await marker.getFile()).text()!=="MedianController.MaterialLibrary.1")throw Error("Choose the custom surfaces Library folder shown above.");
+  busy(true);const material=await prepareMaterial();
+  for await(const entry of directory.values()){
+   if(entry.kind!=="directory")continue;let old;
+   try{old=JSON.parse(await(await(await entry.getFileHandle("material.json")).getFile()).text());}catch{continue;}
+   if(old.id===material.manifest.id){
+    if(old.fingerprint!==material.manifest.fingerprint)throw Error("Material ID collision. Existing material was preserved.");
+    $("status").textContent="This material is already installed. Use Refresh custom surfaces in settings.";return;
+   }
+  }
+  let folderName=material.name;
+  try{
+   await directory.getDirectoryHandle(folderName);folderName=material.name.slice(0,65)+"-"+material.manifest.id;
+   try{await directory.getDirectoryHandle(folderName);throw Error("That surface folder already exists. Choose a new surface name.");}catch(error){if(error.name!=="NotFoundError")throw error;}
+  }catch(error){if(error.name!=="NotFoundError")throw error;}
+  const target=await directory.getDirectoryHandle(folderName,{create:true});
+  // The manifest is last: the game only sees a finished material.
+  for(const entry of material.entries)await writeFile(target,entry.name,entry.bytes);
+  $("status").textContent="Imported as "+folderName+". Use Refresh custom surfaces in mod settings, or restart the game.";
+ }catch(error){$("status").textContent=error.name==="AbortError"?"Cancelled. Your original files are unchanged.":"Could not import: "+error.message;}finally{busy(false);}
+});
+$("download").addEventListener("click",async()=>{if(!$("form").reportValidity())return;busy(true);try{const material=await prepareMaterial(),url=URL.createObjectURL(makeZip(material.entries.map(e=>({...e,name:material.name+"/"+e.name})))),link=document.createElement("a");link.href=url;link.download=material.name+".zip";document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);$("status").textContent="Material pack downloaded. Extract the named folder into Materials/Library, then Refresh custom surfaces in settings.";}catch(error){$("status").textContent="Could not export: "+error.message;}finally{busy(false);}});
+</script></body></html>

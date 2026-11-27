@@ -6,11 +6,13 @@ using Game.Common;
 using Game.Net;
 using Game.Prefabs;
 using Game.Rendering;
+using Unity.Collections;
 using Unity.Entities;
 using UnityEngine.Scripting;
 
 namespace RoadGrass
 {
+    internal struct RoadGrassPendingOverride : IComponentData { }
     /// <summary>
     /// Durable descriptor for the ordinary Median and Road Edge restore modes.
     /// The generated composition mesh is runtime-only; this record is the part
@@ -57,8 +59,10 @@ namespace RoadGrass
         private const int LoadSettleMaximumFrames = 240;
 
         private EntityQuery m_CityQuery;
+        private EntityQuery m_ChangedPendingQuery;
         private readonly Dictionary<Entity, RoadGrassArea> m_Pending = new();
         private readonly List<Entity> m_Completed = new();
+        private readonly List<KeyValuePair<Entity, RoadGrassArea>> m_Work = new();
         private bool m_GameReady;
         private bool m_NeedsHydration;
         private bool m_SuspendedForSave;
@@ -67,6 +71,7 @@ namespace RoadGrass
         private int m_LoadSettleQuietFrames;
         private int m_LoadSettleStartFrame;
         private int m_LoadSettleLastFrame;
+        private int m_RetryPasses;
 
         internal static RoadGrassOverridePersistenceSystem Instance { get; private set; }
 
@@ -77,6 +82,11 @@ namespace RoadGrass
             Instance = this;
             m_CityQuery = GetEntityQuery(
                 ComponentType.ReadOnly<Game.City.City>());
+            m_ChangedPendingQuery = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[] { ComponentType.ReadOnly<RoadGrassPendingOverride>() },
+                Any = new[] { ComponentType.ReadOnly<Updated>(), ComponentType.ReadOnly<Deleted>() }
+            });
         }
 
         [Preserve]
@@ -84,6 +94,7 @@ namespace RoadGrass
         {
             base.OnGamePreload(purpose, mode);
             RoadGrassRequest.RestoreAllRuntime(EntityManager);
+            ClearPendingTags();
             m_Pending.Clear();
             m_Completed.Clear();
             m_GameReady = false;
@@ -94,6 +105,7 @@ namespace RoadGrass
             m_LoadSettleQuietFrames = 0;
             m_LoadSettleStartFrame = 0;
             m_LoadSettleLastFrame = -1;
+            m_RetryPasses = 0;
         }
 
         [Preserve]
@@ -140,18 +152,27 @@ namespace RoadGrass
                 return;
             }
 
-            if (m_RetryCountdown > 0)
+            bool startup = m_RetryPasses > 0;
+            if (!startup && m_ChangedPendingQuery.IsEmptyIgnoreFilter) return;
+            if (startup && m_RetryCountdown > 0)
             {
                 m_RetryCountdown--;
                 return;
             }
             m_RetryCountdown = RetryInterval;
+            if (startup) m_RetryPasses--;
 
-            // This is a bounded load/reload path, not a perpetual city-wide
-            // simulation scan. Missing RoadBuilder compositions remain pending
-            // and are retried without forcing any job completion.
+            // After startup, unresolved records wake only when their own road changes.
             m_Completed.Clear();
-            foreach (KeyValuePair<Entity, RoadGrassArea> entry in m_Pending)
+            m_Work.Clear();
+            if (startup) m_Work.AddRange(m_Pending);
+            else
+            {
+                using var changed = m_ChangedPendingQuery.ToEntityArray(Allocator.Temp);
+                foreach (var edge in changed)
+                    if (m_Pending.TryGetValue(edge, out var areas)) m_Work.Add(new KeyValuePair<Entity, RoadGrassArea>(edge, areas));
+            }
+            foreach (KeyValuePair<Entity, RoadGrassArea> entry in m_Work)
             {
                 Entity edge = entry.Key;
                 RoadGrassArea areas = entry.Value & PersistedAreaMask;
@@ -176,6 +197,9 @@ namespace RoadGrass
                     continue;
                 }
 
+                if (startup && !EntityManager.HasComponent<RoadGrassPendingOverride>(edge))
+                    EntityManager.AddComponent<RoadGrassPendingOverride>(edge);
+
                 if (!TryGetComposition(edge, out Entity composition))
                 {
                     continue;
@@ -198,12 +222,14 @@ namespace RoadGrass
 
             for (int i = 0; i < m_Completed.Count; i++)
             {
+                RemovePendingTag(m_Completed[i]);
                 m_Pending.Remove(m_Completed[i]);
             }
         }
 
         internal void RecordOverride(Entity edge, RoadGrassArea areas)
         {
+            RemovePendingTag(edge);
             areas &= PersistedAreaMask;
             if (edge == Entity.Null || areas == RoadGrassArea.None ||
                 !TryGetPersistentOverrides(create: true, out var overrides))
@@ -250,12 +276,14 @@ namespace RoadGrass
 
         internal void RemoveOverride(Entity edge)
         {
+            RemovePendingTag(edge);
             RemovePersistentOverride(edge);
             m_Pending.Remove(edge);
         }
 
         internal void ClearAllData()
         {
+            ClearPendingTags();
             if (TryGetPersistentOverrides(create: false, out var overrides))
             {
                 overrides.Clear();
@@ -276,6 +304,7 @@ namespace RoadGrass
 
             PruneDeletedOverrides();
             m_SuspendedForSave = true;
+            ClearPendingTags();
             m_Pending.Clear();
             RoadGrassRequest.RestoreAllRuntime(EntityManager);
 
@@ -353,7 +382,9 @@ namespace RoadGrass
 
         private void LoadPersistentOverrides()
         {
+            ClearPendingTags();
             m_Pending.Clear();
+            m_RetryPasses = 48;
             if (!TryGetPersistentOverrides(create: true, out var overrides))
             {
                 return;
@@ -386,9 +417,23 @@ namespace RoadGrass
             {
                 overrides.Add(new RoadGrassSavedOverride(entry.Key, entry.Value));
             }
+            // Adding tags is structural: release the live city buffer before doing it.
+            foreach (var edge in m_Pending.Keys)
+                if (EntityManager.Exists(edge) && !EntityManager.HasComponent<Deleted>(edge) && !EntityManager.HasComponent<RoadGrassPendingOverride>(edge))
+                    EntityManager.AddComponent<RoadGrassPendingOverride>(edge);
 
             Mod.TryInfo(
                 $"Loaded {m_Pending.Count} persistent Median Controller override(s) from the city save buffer");
+        }
+
+        private void RemovePendingTag(Entity edge)
+        {
+            if (EntityManager.Exists(edge) && EntityManager.HasComponent<RoadGrassPendingOverride>(edge))
+                EntityManager.RemoveComponent<RoadGrassPendingOverride>(edge);
+        }
+        private void ClearPendingTags()
+        {
+            foreach (var edge in m_Pending.Keys) RemovePendingTag(edge);
         }
 
         private bool TryGetPersistentOverrides(

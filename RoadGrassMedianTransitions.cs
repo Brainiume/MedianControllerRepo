@@ -1,7 +1,10 @@
 using System.Collections.Generic;
 using Colossal.Mathematics;
+using Colossal.Entities;
 using Game.Net;
 using Game.Prefabs;
+using Game.Rendering;
+using SubLane = Game.Net.SubLane;
 using Unity.Entities;
 using Unity.Mathematics;
 
@@ -19,6 +22,120 @@ namespace RoadGrass
 
         private readonly Dictionary<(RoadGrassMedianAnchorKey, RoadGrassMedianAnchorKey), TransitionPair>
             m_TransitionPlans = new();
+
+        private List<RoadGrassTaperGeometry.Lane> GetConnectionCrosswalks(Entity node)
+        {
+            var result = new List<RoadGrassTaperGeometry.Lane>();
+            var seen = new HashSet<Entity>();
+            void Read(Entity owner)
+            {
+                if (!EntityManager.HasBuffer<SubLane>(owner)) return;
+                foreach (var item in EntityManager.GetBuffer<SubLane>(owner, true))
+                {
+                    var lane = item.m_SubLane;
+                    if (!seen.Add(lane) || EntityManager.HasComponent<Game.Common.Deleted>(lane) ||
+                        EntityManager.HasComponent<Game.Tools.Temp>(lane) ||
+                        !EntityManager.TryGetComponent(lane, out Game.Net.PedestrianLane pedestrian) ||
+                        (pedestrian.m_Flags & Game.Net.PedestrianLaneFlags.Crosswalk) == 0 ||
+                        !EntityManager.TryGetComponent(lane, out Game.Net.Curve curve) ||
+                        !EntityManager.TryGetComponent(lane, out PrefabRef prefab) ||
+                        !EntityManager.TryGetComponent(prefab.m_Prefab, out NetLaneData data) ||
+                        !math.isfinite(data.m_Width) || !math.all(math.isfinite(curve.m_Bezier.a)) ||
+                        !math.all(math.isfinite(curve.m_Bezier.b)) || !math.all(math.isfinite(curve.m_Bezier.c)) ||
+                        !math.all(math.isfinite(curve.m_Bezier.d))) continue;
+                    result.Add(new RoadGrassTaperGeometry.Lane { Curve = curve.m_Bezier, Width = data.m_Width });
+                }
+            }
+            Read(node);
+            if (EntityManager.HasBuffer<ConnectedEdge>(node))
+                foreach (var edge in EntityManager.GetBuffer<ConnectedEdge>(node, true)) Read(edge.m_Edge);
+            return result;
+        }
+
+        private List<MedianRenderState> CrosswalkRenderSpans(RoadGrassResolvedMedianAnchor source,
+            RoadGrassMedianAnchorKey paired, EdgeGeometry geometry, List<RoadGrassTaperGeometry.Lane> crosswalks,
+            RoadGrassTransitionMesh.Half transition)
+        {
+            if (crosswalks.Count == 0) return null;
+            var ranges = RoadGrassTransitionMesh.CrosswalkRanges(geometry, crosswalks);
+            if (ranges.Count == 1 && math.all(ranges[0] == new float2(0, 1))) return null;
+            ranges = CapCrosswalkSpans(transition?.Source ?? GetStyledContinuation(source), geometry, ranges);
+            var result = new List<MedianRenderState>();
+            foreach (var range in ranges)
+            {
+                var piece = RoadGrassTransitionMesh.Slice(geometry, range);
+                BatchDataHelpers.CompositionParameters parameters;
+                if (transition == null) BatchDataHelpers.CalculateEdgeParameters(piece, false, out parameters);
+                else
+                {
+                    float2 border = RoadGrassTransitionMesh.ReadBorderWidths(EntityManager, transition.Source);
+                    var half = RoadGrassTransitionMesh.Create(transition.Source, piece, border, border);
+                    if (range.y == 1)
+                    {
+                        half.Geometry.m_SyncVertexTargetsLeft = transition.Geometry.m_SyncVertexTargetsLeft;
+                        half.Geometry.m_SyncVertexTargetsRight = transition.Geometry.m_SyncVertexTargetsRight;
+                    }
+                    BatchDataHelpers.CalculateNodeParameters(half.Geometry, transition.Composition, out parameters);
+                }
+                result.Add(new MedianRenderState(paired, parameters, piece.m_Bounds));
+            }
+            return result;
+        }
+
+        private static bool RenderSpansEqual(List<MedianRenderState> a, List<MedianRenderState> b)
+        {
+            if (a == null || b == null) return a == b;
+            if (a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+                if (!a[i].Parameters.Equals(b[i].Parameters) || !a[i].Bounds.Equals(b[i].Bounds)) return false;
+            return true;
+        }
+
+        private static bool CrosswalksEqual(List<RoadGrassTaperGeometry.Lane> a, List<RoadGrassTaperGeometry.Lane> b)
+        {
+            if (a == null || a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+                if (!a[i].Curve.Equals(b[i].Curve) || a[i].Width != b[i].Width) return false;
+            return true;
+        }
+
+        internal void RefreshCrosswalkClearance(Entity edge = default)
+        {
+            foreach (var key in new List<RoadGrassMedianAnchorKey>(m_RenderStates.Keys))
+            {
+                var state = m_RenderStates[key];
+                if (key.Equals(state.Paired) || (edge != Entity.Null && key.Edge != edge && state.Paired.Edge != edge) ||
+                    !state.ConnectionGeometry.HasValue || !m_RenderStates.TryGetValue(state.Paired, out var opposite) ||
+                    !opposite.ConnectionGeometry.HasValue || !m_Resolved.TryGetValue(key, out var a) ||
+                    !m_Resolved.TryGetValue(state.Paired, out var b)) continue;
+                CachePairGeometry(a, b, state.ConnectionGeometry.Value, opposite.ConnectionGeometry.Value);
+            }
+        }
+
+        private ulong LinkedPairId(RoadGrassMedianAnchorKey key)
+        {
+            if (EntityManager.HasBuffer<RoadGrassMedianPieceLink>(key.Edge))
+                foreach (var link in EntityManager.GetBuffer<RoadGrassMedianPieceLink>(key.Edge, true))
+                    if (link.Local.End == key.End && link.Local.Ordinal == key.Ordinal) return link.PairId;
+            return 0;
+        }
+        private bool HasCrosswalkGaps(RoadGrassMedianAnchorKey key) => m_CrosswalkGapPairs.Contains(LinkedPairId(key));
+        internal void SetLinkedCrosswalkGaps(RoadGrassMedianAnchorKey key, bool value)
+        {
+            ulong id = LinkedPairId(key);
+            if (id == 0 || !TryGetPersistentPairs(false, out var pairs)) return;
+            for (int i = 0; i < pairs.Length; i++)
+            {
+                if (pairs[i].PairId != id) continue;
+                var pair = pairs[i];
+                if (pair.CrosswalkGaps == value) return;
+                pair.CrosswalkGaps = value; pairs[i] = pair;
+                if (value) m_CrosswalkGapPairs.Add(id); else m_CrosswalkGapPairs.Remove(id);
+                RefreshCrosswalkClearance(key.Edge);
+                m_Dirty = true;
+                return;
+            }
+        }
 
         internal void RefreshTransitionCalibration()
         {

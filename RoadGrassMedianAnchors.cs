@@ -16,6 +16,8 @@ namespace RoadGrass
         internal readonly Entity Edge;
         internal readonly bool End;
         internal readonly int Ordinal;
+        // Keep roadside identities separate from both median ordinals and polygon render keys.
+        internal bool IsRoadsideGrass => Ordinal <= int.MinValue / 2;
 
         internal RoadGrassMedianAnchorKey(Entity edge, bool end, int ordinal)
         {
@@ -77,9 +79,13 @@ namespace RoadGrass
             ComponentLookup<NetPieceData> pieceData,
             ComponentLookup<NetVertexMatchData> vertexMatchData,
             out List<RoadGrassResolvedMedianAnchor> anchors,
-            CompositionFlags? requestedFlags = null)
+            out bool invalidData,
+            CompositionFlags? requestedFlags = null,
+            bool includeRoadsideGrass = false,
+            PrefabSystem prefabs = null)
         {
             anchors = new List<RoadGrassResolvedMedianAnchor>();
+            invalidData = false;
             if (edgeEntity == Entity.Null || !entityManager.Exists(edgeEntity) ||
                 entityManager.HasComponent<Deleted>(edgeEntity) ||
                 !entityManager.TryGetComponent(edgeEntity, out Edge edge) ||
@@ -96,13 +102,9 @@ namespace RoadGrass
 
             DynamicBuffer<NetGeometrySection> geometrySections =
                 entityManager.GetBuffer<NetGeometrySection>(compositionPrefab.m_Prefab, true);
-            var pieces = new NativeList<NetCompositionPiece>(Allocator.Temp);
-            NetCompositionHelpers.GetCompositionPieces(
-                pieces,
-                geometrySections.AsNativeArray(),
-                flags,
-                subSections,
-                sectionPieces);
+            using var pieces = new NativeList<NetCompositionPiece>(Allocator.Temp);
+            if (!TryGetCompositionPieces(geometrySections, flags, subSections, sectionPieces, pieceData, pieces, out var activeRoots))
+            { invalidData = true; return false; }
 
             NetCompositionData resolvedData = edgeData;
             resolvedData.m_Flags = flags;
@@ -112,11 +114,17 @@ namespace RoadGrass
                 pieceData,
                 vertexMatchData);
 
-            var activeRoots = GetActiveRoots(
-                geometrySections,
-                flags,
-                subSections,
-                sectionPieces);
+            using var plainPieces = includeRoadsideGrass
+                ? new NativeList<NetCompositionPiece>(Allocator.Temp) : default;
+            List<Entity> plainRoots = null;
+            if (includeRoadsideGrass)
+            {
+                CompositionFlags plainFlags = flags;
+                plainFlags.m_Left &= ~CompositionFlags.Side.PrimaryBeautification;
+                plainFlags.m_Right &= ~CompositionFlags.Side.PrimaryBeautification;
+                if (!TryGetCompositionPieces(geometrySections, plainFlags, subSections, sectionPieces, pieceData, plainPieces, out plainRoots))
+                { invalidData = true; return false; }
+            }
             int ordinal = 0;
             int index = 0;
             while (index < pieces.Length)
@@ -183,14 +191,49 @@ namespace RoadGrass
                 // that identity here, then reject anything that actually
                 // contains road or bicycle lanes.
                 bool physicalMedian = blockingDivider || prefabBlockingDivider;
-                if (physicalMedian && !containsVehicleLane && visibleMedianMesh &&
+                bool roadsideGrass = false;
+                if (includeRoadsideGrass && !physicalMedian && !containsVehicleLane)
+                {
+                    // Select the native grass replacement, not the wider sidewalk section.
+                    int grassIndex = -1;
+                    for (int i = 0; i < group.Count; i++)
+                    {
+                        var candidate = group[i];
+                        if ((candidate.m_SectionFlags & (NetSectionFlags.Left | NetSectionFlags.Right)) == 0 ||
+                            (candidate.m_SectionFlags & (NetSectionFlags.Hidden | NetSectionFlags.Underground | NetSectionFlags.Overhead)) != 0 ||
+                            (candidate.m_PieceFlags & NetPieceFlags.HasMesh) == 0) continue;
+                        bool unchanged = false;
+                        for (int j = 0; j < plainPieces.Length; j++)
+                            if (plainPieces[j].m_SectionIndex >= 0 && plainPieces[j].m_SectionIndex < plainRoots.Count &&
+                                plainRoots[plainPieces[j].m_SectionIndex] == root &&
+                                plainPieces[j].m_Piece == candidate.m_Piece) { unchanged = true; break; }
+                        bool? nativeGrass = HasNativeGrassSurface(entityManager, prefabs, candidate.m_Piece);
+                        if (nativeGrass == false || (nativeGrass != true && unchanged)) continue;
+                        if (grassIndex < 0 || candidate.m_Size.x > group[grassIndex].m_Size.x)
+                            grassIndex = i;
+                    }
+                    if (grassIndex >= 0)
+                    {
+                        var grass = group[grassIndex];
+                        // Keep matching native curb pieces, excluding pavement outside this strip.
+                        group.RemoveAll(p => (p.m_PieceFlags & NetPieceFlags.HasMesh) == 0 ||
+                            (p.m_SectionFlags & (NetSectionFlags.Hidden | NetSectionFlags.Underground | NetSectionFlags.Overhead)) != 0 ||
+                            math.abs(p.m_Offset.x - grass.m_Offset.x) + p.m_Size.x * 0.5f > grass.m_Size.x * 0.5f + 0.01f);
+                        representative = grass.m_Piece;
+                        representativeIndex = group.FindIndex(p => p.m_Piece == representative);
+                        roadsideGrass = representativeIndex >= 0;
+                    }
+                }
+                if ((physicalMedian || roadsideGrass) && !containsVehicleLane && visibleMedianMesh &&
                     representative != Entity.Null && representativeIndex >= 0)
                 {
                     // CalculateCompositionData has already placed every piece
                     // in full-road coordinates. All alternatives in one
                     // section share this section centre; using it directly is
                     // reliable for narrow and asymmetric RoadBuilder medians.
-                    float center = group[0].m_Offset.x;
+                    float2 grassInterval = roadsideGrass
+                        ? GetRoadsideGrassInterval(entityManager, prefabs, group[representativeIndex]) : default;
+                    float center = roadsideGrass ? math.csum(grassInterval) * 0.5f : group[0].m_Offset.x;
                     var standalonePieces = new NativeArray<NetCompositionPiece>(
                         group.Count,
                         Allocator.Temp);
@@ -203,6 +246,10 @@ namespace RoadGrass
                         // origin or that translation is applied a second time,
                         // which is especially visible on asymmetric roads.
                         standalonePiece.m_Offset.x -= center;
+                        if (roadsideGrass)
+                            standalonePiece.m_SectionFlags = (standalonePiece.m_SectionFlags &
+                                ~(NetSectionFlags.Left | NetSectionFlags.Right | NetSectionFlags.AlignCenter)) |
+                                NetSectionFlags.Median;
                         standalonePieces[i] = standalonePiece;
                     }
 
@@ -214,11 +261,29 @@ namespace RoadGrass
                         pieceData,
                         vertexMatchData);
                     float width = standalone.m_Width;
+                    if (roadsideGrass)
+                    {
+                        // This carrier contains one strip, not either half of the original road.
+                        width = grassInterval.y - grassInterval.x;
+                        standalone.m_Width = width;
+                        standalone.m_MiddleOffset = 0f;
+                        for (int i = 0; i < group.Count; i++)
+                        {
+                            var piece = standalonePieces[i];
+                            piece.m_Offset.x = group[i].m_Offset.x - center;
+                            standalonePieces[i] = piece;
+                        }
+                    }
                     group.Clear();
                     for (int i = 0; i < standalonePieces.Length; i++)
                     {
                         group.Add(standalonePieces[i]);
                     }
+
+                    if (roadsideGrass && width > 0.01f)
+                        RoadGrassTransitionMesh.SetSyncOffsets(ref standalone,
+                            RoadGrassTransitionMesh.ReadBorderWidths(entityManager,
+                                new RoadGrassResolvedMedianAnchor { Width = width, Pieces = group }));
                     standalonePieces.Dispose();
 
                     if (!math.isfinite(center) || !math.isfinite(width) || width <= 0.01f)
@@ -228,14 +293,14 @@ namespace RoadGrass
                     }
                     var data = new RoadGrassMedianAnchorData(
                         end,
-                        ordinal,
+                        roadsideGrass ? int.MinValue + sectionIndex : ordinal,
                         root,
                         representative,
                         center / math.max(0.01f, resolvedData.m_Width),
                         width);
                     anchors.Add(new RoadGrassResolvedMedianAnchor
                     {
-                        Key = new RoadGrassMedianAnchorKey(edgeEntity, end, ordinal),
+                        Key = new RoadGrassMedianAnchorKey(edgeEntity, end, data.Ordinal),
                         Node = node,
                         Data = data,
                         SourceComposition = composition.m_Edge,
@@ -248,14 +313,75 @@ namespace RoadGrass
                         Right = center + width * 0.5f,
                         Signature = CalculateSignature(data, group)
                     });
-                    ordinal++;
+                    if (!roadsideGrass) ordinal++;
                 }
 
                 index = endIndex;
             }
 
-            pieces.Dispose();
             return anchors.Count > 0;
+        }
+
+        private static float2 GetRoadsideGrassInterval(EntityManager manager, PrefabSystem prefabs,
+            NetCompositionPiece piece)
+        {
+            float2 local = new float2(-piece.m_Size.x * 0.5f, piece.m_Size.x * 0.5f);
+            if (manager.HasComponent<MeshData>(piece.m_Piece))
+            {
+                var bounds = manager.GetComponentData<MeshData>(piece.m_Piece).m_Bounds;
+                if (math.isfinite(bounds.max.x - bounds.min.x) && bounds.max.x - bounds.min.x > 0.01f)
+                    local = new float2(bounds.min.x, bounds.max.x);
+            }
+            // Cached native grass submesh indices identify its visible footprint, including
+            // asymmetric sidewalk assets. Reading them avoids loading geometry assets on hover.
+            if (prefabs != null && manager.HasBuffer<MeshVertex>(piece.m_Piece) &&
+                manager.HasBuffer<MeshIndex>(piece.m_Piece) && manager.HasBuffer<MeshMaterial>(piece.m_Piece) &&
+                prefabs.TryGetPrefab<RenderPrefab>(piece.m_Piece, out var prefab))
+            {
+                var vertices = manager.GetBuffer<MeshVertex>(piece.m_Piece, true);
+                var indices = manager.GetBuffer<MeshIndex>(piece.m_Piece, true);
+                var materials = manager.GetBuffer<MeshMaterial>(piece.m_Piece, true);
+                float min = float.MaxValue, max = float.MinValue;
+                for (int i = 0; i < materials.Length; i++)
+                {
+                    var surface = prefab.GetSurfaceAsset(i);
+                    if (surface == null || (surface.name.IndexOf("grass", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        surface.name.IndexOf("lawn", StringComparison.OrdinalIgnoreCase) < 0)) continue;
+                    var material = materials[i];
+                    int end = math.min(indices.Length, material.m_StartIndex + material.m_IndexCount);
+                    for (int j = math.max(0, material.m_StartIndex); j < end; j++)
+                    {
+                        int vertex = indices[j].m_Index;
+                        if ((uint)vertex >= vertices.Length) continue;
+                        float x = vertices[vertex].m_Vertex.x;
+                        if (!math.isfinite(x)) continue;
+                        min = math.min(min, x);
+                        max = math.max(max, x);
+                    }
+                }
+                if (max - min > 0.01f && math.isfinite(max - min)) local = new float2(min, max);
+            }
+            // Match BatchMeshHelpers.GenerateCompositionMesh: native X is -1 without Invert, +1 with it.
+            if ((piece.m_SectionFlags & NetSectionFlags.Invert) == 0) local = -local.yx;
+            return local + piece.m_Offset.x;
+        }
+
+        private static bool? HasNativeGrassSurface(EntityManager manager, PrefabSystem prefabs, Entity piece)
+        {
+            // Read material metadata only; never load textures or mesh vertices during picking.
+            if (prefabs == null || !manager.HasBuffer<MeshMaterial>(piece) ||
+                !prefabs.TryGetPrefab<RenderPrefab>(piece, out var prefab)) return null;
+            var materials = manager.GetBuffer<MeshMaterial>(piece, true);
+            bool knownSurface = false;
+            for (int i = 0; i < materials.Length; i++)
+            {
+                var surface = prefab.GetSurfaceAsset(i);
+                if (surface == null) continue;
+                knownSurface = true;
+                if (surface.name.IndexOf("grass", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    surface.name.IndexOf("lawn", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return knownSurface ? false : (bool?)null;
         }
 
         internal static bool TryMatch(
@@ -267,8 +393,8 @@ namespace RoadGrass
             if (saved.Ordinal >= 0 && saved.Ordinal < anchors.Count)
             {
                 RoadGrassResolvedMedianAnchor ordinal = anchors[saved.Ordinal];
-                bool rootMatches = saved.RootSection == Entity.Null ||
-                    ordinal.Data.RootSection == saved.RootSection;
+                bool rootMatches = ordinal.Key.Ordinal == saved.Ordinal && (saved.RootSection == Entity.Null ||
+                    ordinal.Data.RootSection == saved.RootSection);
                 bool pieceMatches = saved.RepresentativePiece == Entity.Null ||
                     ordinal.Data.RepresentativePiece == saved.RepresentativePiece;
                 if (rootMatches && pieceMatches)
@@ -307,6 +433,7 @@ namespace RoadGrass
             for (int i = 0; i < anchors.Count; i++)
             {
                 RoadGrassResolvedMedianAnchor candidate = anchors[i];
+                if (candidate.Key.IsRoadsideGrass != (saved.Ordinal <= int.MinValue / 2)) continue;
                 bool prefabMatch =
                     (saved.RootSection != Entity.Null &&
                      candidate.Data.RootSection == saved.RootSection) ||
@@ -361,13 +488,17 @@ namespace RoadGrass
             return flags;
         }
 
-        private static List<Entity> GetActiveRoots(
+        internal static bool TryGetCompositionPieces(
             DynamicBuffer<NetGeometrySection> sections,
             CompositionFlags flags,
             BufferLookup<NetSubSection> subSections,
-            BufferLookup<NetSectionPiece> sectionPieces)
+            BufferLookup<NetSectionPiece> sectionPieces,
+            ComponentLookup<NetPieceData> pieceData,
+            NativeList<NetCompositionPiece> pieces,
+            out List<Entity> roots)
         {
-            var roots = new List<Entity>();
+            roots = new List<Entity>();
+            if (sections.Length == 0) return false;
             CompositionFlags invertedFlags =
                 NetCompositionHelpers.InvertCompositionFlags(flags);
             invertedFlags.m_Left =
@@ -430,9 +561,10 @@ namespace RoadGrass
                 // RoadBuilder median node/stop variants can be nested. Mirror
                 // that traversal so m_SectionIndex and this identity list stay
                 // aligned with the pieces returned by vanilla.
-                for (int depth = 0; depth < 16 &&
-                     subSections.HasBuffer(section.m_Section); depth++)
+                var visited = new HashSet<Entity>();
+                while (subSections.HasBuffer(section.m_Section))
                 {
+                    if (!visited.Add(section.m_Section)) return false;
                     DynamicBuffer<NetSubSection> candidates =
                         subSections[section.m_Section];
                     bool matched = false;
@@ -457,34 +589,41 @@ namespace RoadGrass
 
                 if (!sectionPieces.HasBuffer(section.m_Section))
                 {
-                    continue;
+                    return false;
                 }
 
                 DynamicBuffer<NetSectionPiece> definitions =
                     sectionPieces[section.m_Section];
-                bool producesPieces = false;
+                int start = pieces.Length;
+                NetPieceFlags hidden = 0;
+                if ((section.m_Flags & NetSectionFlags.HiddenSurface) != 0) hidden |= NetPieceFlags.Surface;
+                if ((section.m_Flags & NetSectionFlags.HiddenBottom) != 0) hidden |= NetPieceFlags.Bottom;
+                if ((section.m_Flags & NetSectionFlags.HiddenTop) != 0) hidden |= NetPieceFlags.Top;
+                if ((section.m_Flags & NetSectionFlags.HiddenSide) != 0) hidden |= NetPieceFlags.Side;
                 for (int k = 0; k < definitions.Length; k++)
                 {
                     NetSectionPiece definition = definitions[k];
-                    if (NetCompositionHelpers.TestPieceFlags(
-                            definition,
-                            sectionCompositionFlags,
-                            sectionFlags) ||
-                        NetCompositionHelpers.TestPieceFlags2(
-                            definition,
-                            sectionCompositionFlags,
-                            sectionFlags))
+                    var pieceFlags = definition.m_Flags;
+                    if (!NetCompositionHelpers.TestPieceFlags(definition, sectionCompositionFlags, sectionFlags))
                     {
-                        producesPieces = true;
-                        break;
+                        if (!NetCompositionHelpers.TestPieceFlags2(definition, sectionCompositionFlags, sectionFlags)) continue;
+                        pieceFlags |= NetPieceFlags.SkipBottomHalf;
                     }
+                    if (definition.m_Piece == Entity.Null || !pieceData.HasComponent(definition.m_Piece) ||
+                        !math.all(math.isfinite(section.m_Offset + definition.m_Offset))) return false;
+                    var data = pieceData[definition.m_Piece];
+                    if (!math.isfinite(data.m_Width) || data.m_Width < 0 || !math.isfinite(data.m_Length) || data.m_Length < 0 ||
+                        !math.isfinite(data.m_HeightRange.min) || !math.isfinite(data.m_HeightRange.max)) return false;
+                    pieces.Add(new NetCompositionPiece { m_Piece = definition.m_Piece, m_SectionIndex = roots.Count,
+                        m_SectionFlags = section.m_Flags | ((hidden & pieceFlags) != 0 ? NetSectionFlags.Hidden : 0),
+                        m_PieceFlags = pieceFlags, m_Offset = section.m_Offset + definition.m_Offset });
                 }
-                if (producesPieces)
+                if (pieces.Length != start)
                 {
                     roots.Add(definitionRoot);
                 }
             }
-            return roots;
+            return pieces.Length > 0;
         }
 
         private static bool HasBlockingDividerDefinition(
